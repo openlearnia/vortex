@@ -13,6 +13,7 @@ use vortex::cloud::Registry;
 use vortex::error::VortexResult;
 use vortex::error::vortex_err;
 use vortex::io::compat::Compat;
+use vortex::io::object_store::object_path_from_literal;
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::default);
 
@@ -28,8 +29,13 @@ pub(crate) fn resolve_store(
     store: Option<Arc<dyn ObjectStore>>,
 ) -> VortexResult<ResolvedStore> {
     match store {
-        // If explicit store is provided use that
-        Some(store) => Ok(ResolvedStore::object_store(store, Path::from(url_or_path))),
+        // If explicit store is provided use that. The input is the literal key within the store,
+        // so preserve it verbatim — `Path::from` would percent-encode `~`, `%`, `#`, `[`, `]` and
+        // friends into a key no real object has (#9420).
+        Some(store) => Ok(ResolvedStore::object_store(
+            store,
+            object_path_from_literal(url_or_path),
+        )),
         None => {
             // If the URL does not parse
             match Url::parse(url_or_path) {

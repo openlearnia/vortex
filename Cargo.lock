@@ -9818,6 +9818,7 @@ dependencies = [
 name = "vortex-cloud"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "http",
  "object_store",
  "object_store_opendal",
@@ -9826,8 +9827,14 @@ dependencies = [
  "percent-encoding",
  "rstest",
  "tempfile",
+ "tokio",
  "tracing",
  "url",
+ "vortex-array",
+ "vortex-error",
+ "vortex-file",
+ "vortex-io",
+ "vortex-layout",
  "vortex-utils",
 ]
 
