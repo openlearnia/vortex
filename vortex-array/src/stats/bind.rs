@@ -15,6 +15,13 @@
 //!
 //! Binding also resolves [`RowCount`] placeholders, which rewrite rules emit when a proof needs
 //! the number of rows the scope covers rather than a stored statistic.
+//!
+//! Rewrite rules are independent and are combined with `or`, so several of them may prove the same
+//! thing through different statistics — `is_not_null` is falsified both by
+//! `null_count == row_count` and by `all_null`. Which of those a stats source can actually answer
+//! is only known here, and a source that answers both from the same column lowers them to the same
+//! expression. Binding collapses those duplicates on the way back up, so the predicate is not
+//! evaluated twice per row.
 
 use vortex_error::VortexResult;
 
@@ -25,6 +32,8 @@ use crate::expr::bound::lit;
 use crate::expr::traversal::NodeExt;
 use crate::expr::traversal::Transformed;
 use crate::scalar::Scalar;
+use crate::scalar_fn::fns::binary::Binary;
+use crate::scalar_fn::fns::operators::Operator;
 use crate::scalar_fn::fns::stat::StatFn;
 use crate::scalar_fn::internal::row_count::RowCount;
 
@@ -75,25 +84,48 @@ pub fn bind_stats<B: StatBinder + ?Sized>(
     binder: &B,
 ) -> VortexResult<BoundExpression> {
     Ok(predicate
-        .transform_down(|expr| {
-            // `transform_down` recurses into whatever it substitutes, so a binder may answer with
-            // an expression that itself contains placeholders and have them resolved in this same
-            // pass. That is what lets a stats source express `all_null` as
-            // `null_count == row_count` without a second traversal.
-            let bound = if expr.is::<StatFn>() {
-                bind_stat_fn(&expr, binder)?
-            } else if expr.is::<RowCount>() {
-                binder.bind_row_count()?
-            } else {
-                return Ok(Transformed::no(expr));
-            };
-
-            match bound {
-                Some(bound) => Ok(Transformed::yes(bound)),
-                None => Ok(Transformed::yes(binder.missing_stat(expr.dtype().clone())?)),
-            }
-        })?
+        .transform(bind_placeholder(binder), collapse_duplicate_operand)?
         .into_inner())
+}
+
+/// Substitute a `vortex.stat` or `vortex.row_count` placeholder with the binder's representation.
+fn bind_placeholder<B: StatBinder + ?Sized>(
+    binder: &B,
+) -> impl FnMut(BoundExpression) -> VortexResult<Transformed<BoundExpression>> + '_ {
+    move |expr| {
+        // The traversal recurses into whatever it substitutes, so a binder may answer with an
+        // expression that itself contains placeholders and have them resolved in this same pass.
+        // That is what lets a stats source express `all_null` as `null_count == row_count`
+        // without a second traversal.
+        let bound = if expr.is::<StatFn>() {
+            bind_stat_fn(&expr, binder)?
+        } else if expr.is::<RowCount>() {
+            binder.bind_row_count()?
+        } else {
+            return Ok(Transformed::no(expr));
+        };
+
+        match bound {
+            Some(bound) => Ok(Transformed::yes(bound)),
+            None => Ok(Transformed::yes(binder.missing_stat(expr.dtype().clone())?)),
+        }
+    }
+}
+
+/// Collapse `a or a` and `a and a` to `a`.
+///
+/// Both are idempotent under the three-valued logic pruning uses — `null or null` is `null`, just
+/// as `null` is — so this only removes work, never changes the proof.
+fn collapse_duplicate_operand(expr: BoundExpression) -> VortexResult<Transformed<BoundExpression>> {
+    let is_duplicate = expr
+        .as_opt::<Binary>()
+        .is_some_and(|operator| matches!(operator, Operator::Or | Operator::And))
+        && expr.child(0) == expr.child(1);
+
+    if is_duplicate {
+        return Ok(Transformed::yes(expr.child(0).clone()));
+    }
+    Ok(Transformed::no(expr))
 }
 
 fn bind_stat_fn(
@@ -132,6 +164,7 @@ mod tests {
     use crate::expr::stats::Stat;
     use crate::scalar_fn::EmptyOptions;
     use crate::scalar_fn::ScalarFnVTableExt;
+    use crate::scalar_fn::internal::row_count::RowCount as RowCountFn;
     use crate::stats::all_nan;
     use crate::stats::all_non_nan;
     use crate::stats::nan_count;
@@ -178,7 +211,7 @@ mod tests {
                 return Ok(Some(
                     eq(
                         get_item("f_nan_count", root()),
-                        RowCount.new_expr(EmptyOptions, []),
+                        RowCountFn.new_expr(EmptyOptions, []),
                     )
                     .bind(&self.stats_scope)?,
                 ));
@@ -234,6 +267,45 @@ mod tests {
         assert_eq!(
             bound,
             eq(col("f_nan_count"), lit(10u64)).bind(&binder.stats_scope)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_proofs_collapse() -> VortexResult<()> {
+        let binder = TestBinder::new(true);
+
+        // Two independent proofs of the same fact, reached through different placeholders: one
+        // states `nan_count == row_count` directly, the other asks for `all_nan`, which this
+        // binder answers the same way.
+        let predicate = or(
+            eq(nan_count(col("f")), RowCountFn.new_expr(EmptyOptions, [])),
+            all_nan(col("f")),
+        );
+        let bound = bind_stats(predicate.bind(&binder.input_scope)?, &binder)?;
+
+        assert_eq!(
+            bound,
+            eq(col("f_nan_count"), lit(10u64)).bind(&binder.stats_scope)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_proofs_are_both_kept() -> VortexResult<()> {
+        let binder = TestBinder::new(true);
+
+        // Only collapse operands that are actually equal.
+        let predicate = or(eq(nan_count(col("f")), lit(0u64)), all_nan(col("f")));
+        let bound = bind_stats(predicate.bind(&binder.input_scope)?, &binder)?;
+
+        assert_eq!(
+            bound,
+            or(
+                eq(col("f_nan_count"), lit(0u64)),
+                eq(col("f_nan_count"), lit(10u64)),
+            )
+            .bind(&binder.stats_scope)?
         );
         Ok(())
     }

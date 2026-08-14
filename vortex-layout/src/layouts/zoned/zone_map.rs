@@ -421,6 +421,8 @@ mod tests {
     use vortex_array::expr::BoundExpression;
     use vortex_array::expr::Expression;
     use vortex_array::expr::cast;
+    use vortex_array::expr::eq;
+    use vortex_array::expr::get_item;
     use vortex_array::expr::gt;
     use vortex_array::expr::gt_eq;
     use vortex_array::expr::is_not_null;
@@ -442,6 +444,7 @@ mod tests {
     use vortex_mask::Mask;
 
     use crate::layouts::zoned::zone_map::ROW_COUNT_FIELD;
+    use crate::layouts::zoned::zone_map::STATS_FIELD;
     use crate::layouts::zoned::zone_map::ZoneMap;
     use crate::test::SESSION;
 
@@ -850,6 +853,37 @@ mod tests {
             BoolArray::from_iter([true, true, true]),
             &mut SESSION.create_execution_ctx()
         );
+    }
+
+    #[test]
+    fn duplicate_proofs_collapse_during_lowering() {
+        // `is_not_null` is falsified both by `null_count == row_count` and by `all_null`. This
+        // zone map answers both from its `null_count` column, so the two disjuncts lower to the
+        // same expression and must not be evaluated twice per zone.
+        let zone_map = ZoneMap::try_new_legacy(
+            PType::U64.into(),
+            StructArray::from_fields(&[(
+                "null_count",
+                PrimitiveArray::new(buffer![0u64, 4, 2], Validity::AllValid).into_array(),
+            )])
+            .unwrap(),
+            Arc::new([Stat::NullCount]),
+            4,
+            10,
+        )
+        .unwrap();
+        let scope = zone_map.pruning_scope().unwrap();
+
+        let pruning_expr = falsify(&is_not_null(root()), PType::U64.into());
+        let lowered = zone_map.lower_stats(pruning_expr, scope.dtype()).unwrap();
+
+        let expected = eq(
+            get_item("null_count", get_item(STATS_FIELD, root())),
+            get_item(ROW_COUNT_FIELD, root()),
+        )
+        .bind(scope.dtype())
+        .unwrap();
+        assert_eq!(lowered, expected);
     }
 
     #[test]
