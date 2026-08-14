@@ -22,6 +22,7 @@ use vortex_array::arrays::StructArray;
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldNames;
+use vortex_array::dtype::StructFields;
 use vortex_array::expr::BoundExpression;
 use vortex_array::expr::Expression;
 use vortex_array::expr::eq;
@@ -29,7 +30,6 @@ use vortex_array::expr::get_item;
 use vortex_array::expr::lit;
 use vortex_array::expr::root;
 use vortex_array::expr::stats::Stat;
-use vortex_array::expr::transform::replace;
 use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::ScalarFnVTableExt;
 use vortex_array::scalar_fn::fns::literal::Literal;
@@ -60,10 +60,8 @@ pub struct ZoneMap {
     array: StructArray,
     // Aggregate functions stored in the zone map, ordered by their stats-table fields.
     aggregate_fns: Arc<[AggregateFnRef]>,
-    // The length of each zone in the zone map.
-    zone_len: u64,
-    // Number of rows that the zone map covers
-    row_count: u64,
+    // Scope that lowered pruning predicates are evaluated against. See [`pruning_scope`].
+    scope: StructArray,
 }
 
 impl ZoneMap {
@@ -92,12 +90,12 @@ impl ZoneMap {
         zone_len: u64,
         row_count: u64,
     ) -> Self {
+        let scope = pruning_scope(&array, zone_len, row_count);
         Self {
             column_dtype,
             array,
             aggregate_fns,
-            zone_len,
-            row_count,
+            scope,
         }
     }
 
@@ -140,66 +138,69 @@ impl ZoneMap {
         session: &VortexSession,
     ) -> VortexResult<Mask> {
         let mut ctx = session.create_execution_ctx();
-        let scope = self.pruning_scope()?;
-        let predicate = self.lower_stats(predicate.clone(), scope.dtype())?;
+        let predicate = self.lower_stats(predicate.clone())?;
 
-        // A predicate that binds to a constant needs no per-zone evaluation. This is the common
-        // shape when the zone map is missing the stats a proof needs: every placeholder binds to a
-        // typed null, which collapses the whole tree to a null literal.
+        // A rewrite rule that proves its case from the predicate alone lowers to a constant, which
+        // needs no per-zone evaluation.
         if let Some(scalar) = predicate.as_opt::<Literal>() {
-            let len = scope.len();
+            let len = self.scope.len();
             return Ok(match scalar.as_bool().value() {
                 Some(true) => Mask::new_true(len),
                 Some(false) | None => Mask::new_false(len),
             });
         }
 
-        scope
+        self.scope
+            .clone()
             .into_array()
             .apply_bound(&predicate)?
             .null_as_false()
             .execute(&mut ctx)
     }
 
-    /// Build the scope that a lowered pruning predicate is evaluated against.
-    ///
-    /// The scope is a two-field struct: [`STATS_FIELD`] nests the stored zone-map table, and
-    /// [`ROW_COUNT_FIELD`] holds the number of rows in each zone. The row count is a layout
-    /// property rather than a stored stat, and the final zone may be shorter than the nominal zone
-    /// length, so it cannot be resolved to a literal. Materializing it costs nothing: uniform zones
-    /// use a [`ConstantArray`] and a short final zone uses a two-run run-end encoded array.
-    ///
-    /// Nesting is what keeps the row count addressable. Appending it beside the stat columns would
-    /// put a name this module chooses into a namespace that aggregate display names and legacy stat
-    /// names also write to, and a collision would not be loud: [`StructFields`] permits duplicate
-    /// names and resolves lookups to the *first* match, so a colliding stat column would silently
-    /// shadow the row count and corrupt pruning. One level down, stat names cannot reach the two
-    /// names this module owns.
-    ///
-    /// [`StructFields`]: vortex_array::dtype::StructFields
-    fn pruning_scope(&self) -> VortexResult<StructArray> {
-        let num_zones = self.array.len();
-        StructArray::try_new(
-            FieldNames::from([STATS_FIELD, ROW_COUNT_FIELD]),
-            [
-                self.array.clone().into_array(),
-                row_count_array(self.zone_len, self.row_count, num_zones)?,
-            ],
+    fn lower_stats(&self, predicate: BoundExpression) -> VortexResult<BoundExpression> {
+        let binder = ZoneMapStatsBinder {
+            zone_map: self,
+            scope_dtype: self.scope.dtype(),
+        };
+        bind_stats(predicate, &binder)
+    }
+}
+
+/// Build the scope that a lowered pruning predicate is evaluated against.
+///
+/// The scope is a two-field struct: [`STATS_FIELD`] nests the stored zone-map table, and
+/// [`ROW_COUNT_FIELD`] holds the number of rows in each zone. The row count is a layout property
+/// rather than a stored stat, and the final zone may be shorter than the nominal zone length, so it
+/// cannot be resolved to a literal. Materializing it costs nothing: uniform zones use a
+/// [`ConstantArray`] and a short final zone uses a two-run run-end encoded array.
+///
+/// Nesting is what keeps the row count addressable. Appending it beside the stat columns would put
+/// a name this module chooses into a namespace that aggregate display names and legacy stat names
+/// also write to, and a collision would not be loud: [`StructFields`] permits duplicate names and
+/// resolves lookups to the *first* match, so a colliding stat column would silently shadow the row
+/// count and corrupt pruning. One level down, stat names cannot reach the two names this module
+/// owns.
+///
+/// The scope is built once per zone map rather than per predicate, because its dtype and its
+/// row-count column depend only on the stats table and the layout's zone geometry.
+fn pruning_scope(array: &StructArray, zone_len: u64, row_count: u64) -> StructArray {
+    let num_zones = array.len();
+    let row_counts = row_count_array(zone_len, row_count, num_zones);
+    let fields = StructFields::new(
+        FieldNames::from([STATS_FIELD, ROW_COUNT_FIELD]),
+        vec![array.dtype().clone(), row_counts.dtype().clone()],
+    );
+
+    // SAFETY: both fields are `num_zones` long and their dtypes are taken from the arrays
+    // themselves, so they match the struct dtype by construction.
+    unsafe {
+        StructArray::new_unchecked(
+            [array.clone().into_array(), row_counts],
+            fields,
             num_zones,
             Validity::NonNullable,
         )
-    }
-
-    fn lower_stats(
-        &self,
-        predicate: BoundExpression,
-        scope_dtype: &DType,
-    ) -> VortexResult<BoundExpression> {
-        let binder = ZoneMapStatsBinder {
-            zone_map: self,
-            scope_dtype,
-        };
-        bind_stats(predicate, &binder)
     }
 }
 
@@ -286,11 +287,18 @@ impl StatBinder for ZoneMapStatsBinder<'_> {
 }
 
 impl ZoneMapStatsBinder<'_> {
-    /// Bind a stat expression, which is built against the stored zone-map table, by rebasing it
-    /// onto the nested [`STATS_FIELD`] of the pruning scope.
+    /// Bind a stat expression against the pruning scope it was built for.
     fn bind_target(&self, expr: Expression) -> VortexResult<BoundExpression> {
-        replace(expr, &root(), get_item(STATS_FIELD, root())).bind(self.scope_dtype)
+        expr.bind(self.scope_dtype)
     }
+}
+
+/// Root of the stored zone-map table within the pruning scope.
+///
+/// Stat expressions are built against this rather than against the scope root, so that binding a
+/// stat is a single walk rather than a build-then-rebase.
+fn stats_root() -> Expression {
+    get_item(STATS_FIELD, root())
 }
 
 impl ZoneMap {
@@ -299,7 +307,7 @@ impl ZoneMap {
         if self.array.unmasked_field_by_name_opt(&field_name).is_some() {
             return Some(aggregate_result_expr(
                 requested,
-                get_item(field_name, root()),
+                get_item(field_name, stats_root()),
             ));
         }
 
@@ -312,10 +320,16 @@ impl ZoneMap {
 
             match stored.can_satisfy(requested) {
                 AggregateFnSatisfaction::Exact => {
-                    return Some(aggregate_result_expr(stored, get_item(field_name, root())));
+                    return Some(aggregate_result_expr(
+                        stored,
+                        get_item(field_name, stats_root()),
+                    ));
                 }
                 AggregateFnSatisfaction::Approximate => {
-                    approximate = Some(aggregate_result_expr(stored, get_item(field_name, root())));
+                    approximate = Some(aggregate_result_expr(
+                        stored,
+                        get_item(field_name, stats_root()),
+                    ));
                 }
                 AggregateFnSatisfaction::No => {}
             }
@@ -336,7 +350,7 @@ impl ZoneMap {
 
     fn legacy_stat_field_expr(&self, stat: Stat) -> Option<Expression> {
         if self.array.unmasked_field_by_name_opt(stat.name()).is_some() {
-            return Some(get_item(stat.name(), root()));
+            return Some(get_item(stat.name(), stats_root()));
         }
 
         None
@@ -360,14 +374,14 @@ fn row_count_expr() -> Expression {
 /// `zone_len` is the nominal zone size; only the final zone may be shorter. The
 /// result is a [`ConstantArray`] for uniform zone sizes, otherwise a two-run
 /// run-end encoded array whose trailing run carries the final zone length.
-fn row_count_array(zone_len: u64, row_count: u64, num_zones: usize) -> VortexResult<ArrayRef> {
+fn row_count_array(zone_len: u64, row_count: u64, num_zones: usize) -> ArrayRef {
     if num_zones == 0 {
-        return Ok(ConstantArray::new(0u64, 0).into_array());
+        return ConstantArray::new(0u64, 0).into_array();
     }
 
     let last_zone_len = row_count - zone_len.saturating_mul((num_zones as u64) - 1);
     if num_zones == 1 || last_zone_len == zone_len {
-        return Ok(ConstantArray::new(last_zone_len, num_zones).into_array());
+        return ConstantArray::new(last_zone_len, num_zones).into_array();
     }
 
     let ends = unsafe {
@@ -384,7 +398,7 @@ fn row_count_array(zone_len: u64, row_count: u64, num_zones: usize) -> VortexRes
 
     // SAFETY: `ends` are strictly increasing, terminate at `num_zones`, and align one-to-one
     // with the non-null run values.
-    Ok(unsafe { RunEnd::new_unchecked(ends, values, 0, num_zones) }.into_array())
+    unsafe { RunEnd::new_unchecked(ends, values, 0, num_zones) }.into_array()
 }
 
 #[cfg(test)]
@@ -872,16 +886,16 @@ mod tests {
             10,
         )
         .unwrap();
-        let scope = zone_map.pruning_scope().unwrap();
+        let scope_dtype = zone_map.scope.dtype();
 
         let pruning_expr = falsify(&is_not_null(root()), PType::U64.into());
-        let lowered = zone_map.lower_stats(pruning_expr, scope.dtype()).unwrap();
+        let lowered = zone_map.lower_stats(pruning_expr).unwrap();
 
         let expected = eq(
             get_item("null_count", get_item(STATS_FIELD, root())),
             get_item(ROW_COUNT_FIELD, root()),
         )
-        .bind(scope.dtype())
+        .bind(scope_dtype)
         .unwrap();
         assert_eq!(lowered, expected);
     }
