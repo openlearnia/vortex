@@ -2726,8 +2726,8 @@ async fn test_can_prune_composite_predicates() -> VortexResult<()> {
 #[tokio::test]
 #[cfg_attr(miri, ignore)]
 async fn test_can_prune_null_predicates() -> VortexResult<()> {
-    // File stats only store `null_count`, so `all_null` and `all_non_null` must be derived from
-    // it during stat binding. `all_null` additionally needs the file's row count.
+    // File stats store `null_count` but not the row count, so `is_not_null` falsification depends
+    // on the `RowCount` placeholder being resolved against the file's own row count.
     let st = StructArray::from_fields(&[
         (
             "never_null",

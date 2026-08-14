@@ -79,7 +79,7 @@ impl StatBinder for FileStatsBinder<'_> {
         Ok(self.stat_ref(&field_path, stat))
     }
 
-    /// File statistics cover the whole file, so every row of this scope covers `row_count` rows.
+    /// File statistics cover the whole file, so the scope's single row covers `row_count` rows.
     fn bind_row_count(&self) -> VortexResult<Option<BoundExpression>> {
         Ok(Some(lit(self.row_count)))
     }

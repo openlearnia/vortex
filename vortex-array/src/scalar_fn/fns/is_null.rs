@@ -106,13 +106,17 @@ mod tests {
     use crate::dtype::DType;
     use crate::dtype::Nullability;
     use crate::expr::col;
+    use crate::expr::eq;
     use crate::expr::get_item;
     use crate::expr::is_null;
+    use crate::expr::lit;
+    use crate::expr::or;
     use crate::expr::root;
     use crate::expr::test_harness;
     use crate::scalar::Scalar;
     use crate::stats::StatsSession;
     use crate::stats::all_non_null;
+    use crate::stats::null_count;
 
     static STATS_SESSION: LazyLock<VortexSession> =
         LazyLock::new(|| VortexSession::empty().with::<StatsSession>());
@@ -238,7 +242,7 @@ mod tests {
 
         assert_eq!(
             expr.bind(&dtype)?.falsify(&STATS_SESSION)?,
-            Some(all_non_null(col("a")).bind(&dtype)?)
+            Some(or(eq(null_count(col("a")), lit(0u64)), all_non_null(col("a")),).bind(&dtype)?)
         );
         Ok(())
     }

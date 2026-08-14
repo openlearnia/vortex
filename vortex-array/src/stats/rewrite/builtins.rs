@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
 use crate::aggregate_fn::AggregateFnRef;
@@ -28,8 +29,10 @@ use crate::expr::bound::or;
 use crate::expr::bound::or_collect;
 use crate::expr::stats::Stat;
 use crate::scalar::StringLike;
+use crate::scalar_fn::EmptyOptions;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
+use crate::scalar_fn::ScalarFnVTableExt;
 use crate::scalar_fn::fns::between::Between;
 use crate::scalar_fn::fns::binary::Binary;
 use crate::scalar_fn::fns::cast::Cast;
@@ -43,6 +46,7 @@ use crate::scalar_fn::fns::list_contains::ListContains;
 use crate::scalar_fn::fns::literal::Literal;
 use crate::scalar_fn::fns::operators::CompareOperator;
 use crate::scalar_fn::fns::operators::Operator;
+use crate::scalar_fn::internal::row_count::RowCount;
 use crate::stats::bound::stat;
 use crate::stats::rewrite::StatsRewriteCtx;
 use crate::stats::rewrite::StatsRewriteRule;
@@ -53,8 +57,10 @@ pub(crate) fn register_builtins(session: &StatsSession) {
     session.register_rewrite(BinaryNanCountStatsRewrite);
     session.register_rewrite(BinaryAllNonNanStatsRewrite);
     session.register_rewrite(BetweenStatsRewrite);
+    session.register_rewrite(IsNullNullCountStatsRewrite);
     session.register_rewrite(IsNullAllNonNullStatsRewrite);
     session.register_rewrite(IsNullAllNullStatsRewrite);
+    session.register_rewrite(IsNotNullNullCountStatsRewrite);
     session.register_rewrite(IsNotNullAllNullStatsRewrite);
     session.register_rewrite(IsNotNullAllNonNullStatsRewrite);
     session.register_rewrite(LikeStatsRewrite);
@@ -62,6 +68,12 @@ pub(crate) fn register_builtins(session: &StatsSession) {
     session.register_rewrite(ListContainsAllNonNanStatsRewrite);
     session.register_rewrite(DynamicComparisonNanCountStatsRewrite);
     session.register_rewrite(DynamicComparisonAllNonNanStatsRewrite);
+}
+
+fn row_count() -> BoundExpression {
+    RowCount
+        .try_new_bound_expr(EmptyOptions, [])
+        .vortex_expect("row-count expressions are always well-typed")
 }
 
 #[derive(Debug)]
@@ -156,10 +168,19 @@ fn binary_falsify<P: NonNanProof>(
             let rhs_falsifier = ctx.falsify(rhs)?;
             or_collect(lhs_falsifier.into_iter().chain(rhs_falsifier))
         }
-        Operator::Or => match (ctx.falsify(lhs)?, ctx.falsify(rhs)?) {
-            (Some(lhs), Some(rhs)) if P::EMIT_UNGUARDED_REWRITES => Some(and(lhs, rhs)),
-            _ => None,
-        },
+        Operator::Or => {
+            // Check before recursing: falsifying the children first would repeat the
+            // whole recursive rewrite once per registered `Binary` rule, which is
+            // exponential in `Or`-nesting depth for chains like `a = 1 OR a = 2 OR ...`.
+            if !P::EMIT_UNGUARDED_REWRITES {
+                return Ok(None);
+            }
+
+            match (ctx.falsify(lhs)?, ctx.falsify(rhs)?) {
+                (Some(lhs), Some(rhs)) => Some(and(lhs, rhs)),
+                _ => None,
+            }
+        }
         Operator::Add | Operator::Sub | Operator::Mul | Operator::Div => None,
     })
 }
@@ -185,6 +206,31 @@ impl StatsRewriteRule for BetweenStatsRewrite {
         let lhs = binary(options.lower_strict.to_operator(), lower, arr.clone());
         let rhs = binary(options.upper_strict.to_operator(), arr, upper);
         ctx.falsify(&and(lhs, rhs))
+    }
+}
+
+#[derive(Debug)]
+struct IsNullNullCountStatsRewrite;
+
+impl StatsRewriteRule for IsNullNullCountStatsRewrite {
+    fn scalar_fn_id(&self) -> ScalarFnId {
+        IsNull.id()
+    }
+
+    fn falsify(
+        &self,
+        expr: &BoundExpression,
+        ctx: &StatsRewriteCtx<'_>,
+    ) -> VortexResult<Option<BoundExpression>> {
+        Ok(null_count(expr.child(0), ctx).map(|null_count| eq(null_count, lit(0u64))))
+    }
+
+    fn satisfy(
+        &self,
+        expr: &BoundExpression,
+        ctx: &StatsRewriteCtx<'_>,
+    ) -> VortexResult<Option<BoundExpression>> {
+        Ok(null_count(expr.child(0), ctx).map(|null_count| eq(null_count, row_count())))
     }
 }
 
@@ -219,6 +265,31 @@ impl StatsRewriteRule for IsNullAllNullStatsRewrite {
         _ctx: &StatsRewriteCtx<'_>,
     ) -> VortexResult<Option<BoundExpression>> {
         Ok(Some(all_null(expr.child(0))))
+    }
+}
+
+#[derive(Debug)]
+struct IsNotNullNullCountStatsRewrite;
+
+impl StatsRewriteRule for IsNotNullNullCountStatsRewrite {
+    fn scalar_fn_id(&self) -> ScalarFnId {
+        IsNotNull.id()
+    }
+
+    fn falsify(
+        &self,
+        expr: &BoundExpression,
+        ctx: &StatsRewriteCtx<'_>,
+    ) -> VortexResult<Option<BoundExpression>> {
+        Ok(null_count(expr.child(0), ctx).map(|null_count| eq(null_count, row_count())))
+    }
+
+    fn satisfy(
+        &self,
+        expr: &BoundExpression,
+        ctx: &StatsRewriteCtx<'_>,
+    ) -> VortexResult<Option<BoundExpression>> {
+        Ok(null_count(expr.child(0), ctx).map(|null_count| eq(null_count, lit(0u64))))
     }
 }
 
@@ -455,18 +526,16 @@ fn max(expr: &BoundExpression, ctx: &StatsRewriteCtx<'_>) -> Option<BoundExpress
     stat_expr(expr, Stat::Max, ctx)
 }
 
+fn null_count(expr: &BoundExpression, ctx: &StatsRewriteCtx<'_>) -> Option<BoundExpression> {
+    stat_expr(expr, Stat::NullCount, ctx)
+}
+
 fn all_null(expr: &BoundExpression) -> BoundExpression {
-    match expr.as_opt::<Literal>() {
-        Some(scalar) => lit(scalar.is_null()),
-        None => stat_fn(expr.clone(), AllNull.bind(AggregateEmptyOptions)),
-    }
+    stat_fn(expr.clone(), AllNull.bind(AggregateEmptyOptions))
 }
 
 fn all_non_null(expr: &BoundExpression) -> BoundExpression {
-    match expr.as_opt::<Literal>() {
-        Some(scalar) => lit(!scalar.is_null()),
-        None => stat_fn(expr.clone(), AllNonNull.bind(AggregateEmptyOptions)),
-    }
+    stat_fn(expr.clone(), AllNonNull.bind(AggregateEmptyOptions))
 }
 
 enum NanCheck {
@@ -644,6 +713,8 @@ fn stat_fn(expr: BoundExpression, aggregate_fn: AggregateFnRef) -> BoundExpressi
 mod tests {
     use std::sync::Arc;
     use std::sync::LazyLock;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     use vortex_error::VortexResult;
     use vortex_session::VortexSession;
@@ -652,6 +723,7 @@ mod tests {
     use crate::aggregate_fn::AggregateFnVTableExt;
     use crate::aggregate_fn::EmptyOptions as AggregateEmptyOptions;
     use crate::aggregate_fn::fns::all_non_nan::AllNonNan;
+    use crate::array_session;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
     use crate::dtype::PType;
@@ -676,16 +748,24 @@ mod tests {
     use crate::expr::or;
     use crate::expr::stats::Stat;
     use crate::scalar::Scalar;
+    use crate::scalar_fn::EmptyOptions;
+    use crate::scalar_fn::ScalarFnId;
+    use crate::scalar_fn::ScalarFnVTable;
     use crate::scalar_fn::ScalarFnVTableExt;
     use crate::scalar_fn::fns::between::BetweenOptions;
     use crate::scalar_fn::fns::between::StrictComparison;
+    use crate::scalar_fn::fns::binary::Binary;
     use crate::scalar_fn::fns::dynamic::DynamicComparison;
     use crate::scalar_fn::fns::dynamic::DynamicComparisonExpr;
     use crate::scalar_fn::fns::operators::CompareOperator;
+    use crate::scalar_fn::internal::row_count::RowCount;
     use crate::stats::expr::StatFn;
     use crate::stats::expr::StatOptions;
+    use crate::stats::rewrite::StatsRewriteCtx;
+    use crate::stats::rewrite::StatsRewriteRule;
+    use crate::stats::session::StatsSessionExt;
 
-    static SESSION: LazyLock<VortexSession> = LazyLock::new(crate::array_session);
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(array_session);
 
     fn stat(expr: Expression, stat: Stat) -> Expression {
         let aggregate_fn = stat.aggregate_fn().expect("stat should have aggregate fn");
@@ -794,6 +874,53 @@ mod tests {
                 gt_eq(stat(col("a"), Stat::Min), lit(50)),
             ))
         );
+
+        let expr = or(gt(col("a"), lit(10)), lt(col("a"), lit(5)));
+        assert_rewrite_eq!(
+            falsify(&expr)?,
+            Some(and(
+                lt_eq(stat(col("a"), Stat::Max), lit(10)),
+                gt_eq(stat(col("a"), Stat::Min), lit(5)),
+            ))
+        );
+        Ok(())
+    }
+
+    /// Counts how many times the stats rewrite visits a `Binary` node.
+    #[derive(Debug)]
+    struct BinaryVisitCounter(Arc<AtomicUsize>);
+
+    impl StatsRewriteRule for BinaryVisitCounter {
+        fn scalar_fn_id(&self) -> ScalarFnId {
+            Binary.id()
+        }
+
+        fn falsify(
+            &self,
+            _expr: &BoundExpression,
+            _ctx: &StatsRewriteCtx<'_>,
+        ) -> VortexResult<Option<BoundExpression>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn or_chain_falsify_visits_each_node_once() -> VortexResult<()> {
+        let session = array_session();
+        let visits = Arc::new(AtomicUsize::new(0));
+        session
+            .stats()
+            .register_rewrite(BinaryVisitCounter(Arc::clone(&visits)));
+
+        let expr = (1..16).fold(eq(col("a"), lit(0)), |chain, i| {
+            or(chain, eq(col("a"), lit(i)))
+        });
+        let falsifier = expr.bind(&test_scope())?.falsify(&session)?;
+        assert!(falsifier.is_some());
+
+        // One visit per `Binary` node: 16 comparisons plus 15 `or`s.
+        assert_eq!(visits.load(Ordering::Relaxed), 31);
         Ok(())
     }
 
@@ -821,32 +948,47 @@ mod tests {
 
     #[test]
     fn rewrites_null_falsifiers() -> VortexResult<()> {
-        assert_rewrite_eq!(falsify(&is_null(col("a")))?, Some(all_non_null(&col("a"))));
-        assert_rewrite_eq!(falsify(&is_not_null(col("a")))?, Some(all_null(&col("a"))));
+        assert_rewrite_eq!(
+            falsify(&is_null(col("a")))?,
+            Some(or(
+                eq(stat(col("a"), Stat::NullCount), lit(0u64)),
+                all_non_null(&col("a")),
+            ))
+        );
+
+        assert_rewrite_eq!(
+            falsify(&is_not_null(col("a")))?,
+            Some(or(
+                eq(
+                    stat(col("a"), Stat::NullCount),
+                    RowCount.new_expr(EmptyOptions, []),
+                ),
+                all_null(&col("a")),
+            ))
+        );
         Ok(())
     }
 
     #[test]
     fn rewrites_null_satisfiers() -> VortexResult<()> {
-        assert_rewrite_eq!(satisfy(&is_null(col("a")))?, Some(all_null(&col("a"))));
+        assert_rewrite_eq!(
+            satisfy(&is_null(col("a")))?,
+            Some(or(
+                eq(
+                    stat(col("a"), Stat::NullCount),
+                    RowCount.new_expr(EmptyOptions, []),
+                ),
+                all_null(&col("a")),
+            ))
+        );
+
         assert_rewrite_eq!(
             satisfy(&is_not_null(col("a")))?,
-            Some(all_non_null(&col("a")))
+            Some(or(
+                eq(stat(col("a"), Stat::NullCount), lit(0u64)),
+                all_non_null(&col("a")),
+            ))
         );
-        Ok(())
-    }
-
-    #[test]
-    fn null_rewrites_fold_over_literals() -> VortexResult<()> {
-        assert_rewrite_eq!(falsify(&is_null(lit(1i32)))?, Some(lit(true)));
-        assert_rewrite_eq!(
-            falsify(&is_null(lit(Scalar::null(DType::Primitive(
-                PType::I32,
-                Nullability::Nullable
-            )))))?,
-            Some(lit(false))
-        );
-        assert_rewrite_eq!(falsify(&is_not_null(lit(1i32)))?, Some(lit(false)));
         Ok(())
     }
 

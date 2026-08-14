@@ -10,6 +10,10 @@ use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::aggregate_fn::AggregateFnRef;
 use vortex_array::aggregate_fn::AggregateFnSatisfaction;
+use vortex_array::aggregate_fn::fns::all_nan::AllNan;
+use vortex_array::aggregate_fn::fns::all_non_nan::AllNonNan;
+use vortex_array::aggregate_fn::fns::all_non_null::AllNonNull;
+use vortex_array::aggregate_fn::fns::all_null::AllNull;
 use vortex_array::aggregate_fn::fns::bounded_max::BOUNDED_MAX_BOUND;
 use vortex_array::aggregate_fn::fns::bounded_max::BoundedMax;
 use vortex_array::arrays::ConstantArray;
@@ -17,11 +21,19 @@ use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::dtype::DType;
+use vortex_array::dtype::FieldNames;
 use vortex_array::expr::BoundExpression;
 use vortex_array::expr::Expression;
+use vortex_array::expr::eq;
 use vortex_array::expr::get_item;
+use vortex_array::expr::lit;
 use vortex_array::expr::root;
 use vortex_array::expr::stats::Stat;
+use vortex_array::expr::transform::replace;
+use vortex_array::scalar_fn::EmptyOptions;
+use vortex_array::scalar_fn::ScalarFnVTableExt;
+use vortex_array::scalar_fn::fns::literal::Literal;
+use vortex_array::scalar_fn::internal::row_count::RowCount;
 use vortex_array::stats::bind::StatBinder;
 use vortex_array::stats::bind::bind_stats;
 use vortex_array::validity::Validity;
@@ -119,6 +131,9 @@ impl ZoneMap {
     /// `predicate` should be a stats rewrite expression such as the result of
     /// [`BoundExpression::falsify`]. The returned mask has one value per zone, where
     /// `true` means the zone cannot contain matching rows and can be skipped.
+    ///
+    /// Row-count placeholders are resolved during lowering against a per-zone column that
+    /// [`ZoneMap::pruning_scope`] materializes, so the lowered predicate is directly evaluable.
     pub fn prune(
         &self,
         predicate: &BoundExpression,
@@ -128,6 +143,17 @@ impl ZoneMap {
         let scope = self.pruning_scope()?;
         let predicate = self.lower_stats(predicate.clone(), scope.dtype())?;
 
+        // A predicate that binds to a constant needs no per-zone evaluation. This is the common
+        // shape when the zone map is missing the stats a proof needs: every placeholder binds to a
+        // typed null, which collapses the whole tree to a null literal.
+        if let Some(scalar) = predicate.as_opt::<Literal>() {
+            let len = scope.len();
+            return Ok(match scalar.as_bool().value() {
+                Some(true) => Mask::new_true(len),
+                Some(false) | None => Mask::new_false(len),
+            });
+        }
+
         scope
             .into_array()
             .apply_bound(&predicate)?
@@ -135,32 +161,32 @@ impl ZoneMap {
             .execute(&mut ctx)
     }
 
-    /// The scope that a lowered pruning predicate is evaluated against.
+    /// Build the scope that a lowered pruning predicate is evaluated against.
     ///
-    /// This is the stored zone-map table plus a synthetic [`ROW_COUNT_FIELD`] column holding the
-    /// number of rows in each zone. The row count is a layout property rather than a stored stat,
-    /// and the final zone may be shorter than the nominal zone length, so it cannot be bound to a
-    /// literal. Materializing it costs nothing: uniform zones use a [`ConstantArray`] and a short
-    /// final zone uses a two-run run-end encoded array.
+    /// The scope is a two-field struct: [`STATS_FIELD`] nests the stored zone-map table, and
+    /// [`ROW_COUNT_FIELD`] holds the number of rows in each zone. The row count is a layout
+    /// property rather than a stored stat, and the final zone may be shorter than the nominal zone
+    /// length, so it cannot be resolved to a literal. Materializing it costs nothing: uniform zones
+    /// use a [`ConstantArray`] and a short final zone uses a two-run run-end encoded array.
+    ///
+    /// Nesting is what keeps the row count addressable. Appending it beside the stat columns would
+    /// put a name this module chooses into a namespace that aggregate display names and legacy stat
+    /// names also write to, and a collision would not be loud: [`StructFields`] permits duplicate
+    /// names and resolves lookups to the *first* match, so a colliding stat column would silently
+    /// shadow the row count and corrupt pruning. One level down, stat names cannot reach the two
+    /// names this module owns.
+    ///
+    /// [`StructFields`]: vortex_array::dtype::StructFields
     fn pruning_scope(&self) -> VortexResult<StructArray> {
         let num_zones = self.array.len();
-        let names = self
-            .array
-            .names()
-            .iter()
-            .cloned()
-            .chain([ROW_COUNT_FIELD.into()]);
-        let fields = self
-            .array
-            .iter_unmasked_fields()
-            .cloned()
-            .chain([row_count_array(self.zone_len, self.row_count, num_zones)?]);
-
         StructArray::try_new(
-            names.collect(),
-            fields,
+            FieldNames::from([STATS_FIELD, ROW_COUNT_FIELD]),
+            [
+                self.array.clone().into_array(),
+                row_count_array(self.zone_len, self.row_count, num_zones)?,
+            ],
             num_zones,
-            self.array.struct_validity(),
+            Validity::NonNullable,
         )
     }
 
@@ -177,10 +203,11 @@ impl ZoneMap {
     }
 }
 
-/// Name of the synthetic per-zone row-count column added by [`ZoneMap::pruning_scope`].
-///
-/// The `$` prefix cannot collide with a stat name or an aggregate function's display name.
-const ROW_COUNT_FIELD: &str = "$row_count";
+/// Field of the pruning scope nesting the stored zone-map table.
+const STATS_FIELD: &str = "stats";
+
+/// Field of the pruning scope holding the number of rows in each zone.
+const ROW_COUNT_FIELD: &str = "row_count";
 
 struct ZoneMapStatsBinder<'a> {
     zone_map: &'a ZoneMap,
@@ -208,8 +235,38 @@ impl StatBinder for ZoneMapStatsBinder<'_> {
             return Ok(Some(self.bind_target(stat_expr)?));
         }
 
-        // The boolean `all_null` / `all_nan` family is derived from the count stats by
-        // `bind_stats`, using `bind_row_count` below.
+        if aggregate_fn.is::<AllNull>() {
+            return self
+                .zone_map
+                .stat_field_expr(Stat::NullCount)
+                .map(|null_count| self.bind_target(eq(null_count, row_count_expr())))
+                .transpose();
+        }
+
+        if aggregate_fn.is::<AllNonNull>() {
+            return self
+                .zone_map
+                .stat_field_expr(Stat::NullCount)
+                .map(|null_count| self.bind_target(eq(null_count, lit(0u64))))
+                .transpose();
+        }
+
+        if aggregate_fn.is::<AllNan>() {
+            return self
+                .zone_map
+                .stat_field_expr(Stat::NaNCount)
+                .map(|nan_count| self.bind_target(eq(nan_count, row_count_expr())))
+                .transpose();
+        }
+
+        if aggregate_fn.is::<AllNonNan>() {
+            return self
+                .zone_map
+                .stat_field_expr(Stat::NaNCount)
+                .map(|nan_count| self.bind_target(eq(nan_count, lit(0u64))))
+                .transpose();
+        }
+
         if let Some(stat) = Stat::from_aggregate_fn(aggregate_fn) {
             return self
                 .zone_map
@@ -222,14 +279,17 @@ impl StatBinder for ZoneMapStatsBinder<'_> {
     }
 
     fn bind_row_count(&self) -> VortexResult<Option<BoundExpression>> {
-        self.bind_target(get_item(ROW_COUNT_FIELD, root()))
+        get_item(ROW_COUNT_FIELD, root())
+            .bind(self.scope_dtype)
             .map(Some)
     }
 }
 
 impl ZoneMapStatsBinder<'_> {
+    /// Bind a stat expression, which is built against the stored zone-map table, by rebasing it
+    /// onto the nested [`STATS_FIELD`] of the pruning scope.
     fn bind_target(&self, expr: Expression) -> VortexResult<BoundExpression> {
-        expr.bind(self.scope_dtype)
+        replace(expr, &root(), get_item(STATS_FIELD, root())).bind(self.scope_dtype)
     }
 }
 
@@ -289,6 +349,10 @@ fn aggregate_result_expr(stored: &AggregateFnRef, state_expr: Expression) -> Exp
     } else {
         state_expr
     }
+}
+
+fn row_count_expr() -> Expression {
+    RowCount.new_expr(EmptyOptions, [])
 }
 
 /// Build per-zone row counts for a zone map.
@@ -361,11 +425,13 @@ mod tests {
     use vortex_array::expr::gt_eq;
     use vortex_array::expr::is_not_null;
     use vortex_array::expr::is_null;
+    use vortex_array::expr::list_contains;
     use vortex_array::expr::lit;
     use vortex_array::expr::lt;
     use vortex_array::expr::not_eq;
     use vortex_array::expr::root;
     use vortex_array::expr::stats::Stat;
+    use vortex_array::scalar::Scalar;
     use vortex_array::stats::all_nan;
     use vortex_array::stats::all_non_nan;
     use vortex_array::stats::all_non_null;
@@ -375,6 +441,7 @@ mod tests {
     use vortex_error::VortexResult;
     use vortex_mask::Mask;
 
+    use crate::layouts::zoned::zone_map::ROW_COUNT_FIELD;
     use crate::layouts::zoned::zone_map::ZoneMap;
     use crate::test::SESSION;
 
@@ -549,7 +616,7 @@ mod tests {
     }
 
     #[test]
-    fn pruning_handles_empty_zone_map() {
+    fn row_count_substitution_handles_empty_zone_map() {
         let zone_map = ZoneMap::try_new_legacy(
             PType::U64.into(),
             StructArray::from_fields(&[(
@@ -718,6 +785,71 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn stat_column_cannot_shadow_the_row_count_field() {
+        // A stats column named `row_count` sits one level below the pruning scope's own
+        // `row_count` field, so it cannot shadow it. Were the two flattened into one namespace,
+        // this column would win every lookup: `StructFields` resolves duplicates to the first
+        // match, and pruning would silently read `999` as each zone's row count.
+        let zone_map = unsafe {
+            ZoneMap::new_unchecked(
+                PType::U64.into(),
+                StructArray::from_fields(&[
+                    (
+                        "null_count",
+                        PrimitiveArray::new(buffer![0u64, 4, 2], Validity::AllValid).into_array(),
+                    ),
+                    (
+                        ROW_COUNT_FIELD,
+                        PrimitiveArray::new(buffer![999u64, 999, 999], Validity::AllValid)
+                            .into_array(),
+                    ),
+                ])
+                .unwrap(),
+                Arc::new([]),
+                4,
+                10,
+            )
+        };
+
+        // Zones hold 4, 4 and 2 rows, so the last two are entirely null.
+        let expr = is_not_null(root());
+        let pruning_expr = falsify(&expr, PType::U64.into());
+        let mask = zone_map.prune(&pruning_expr, &SESSION).unwrap();
+        assert_arrays_eq!(
+            mask.into_array(),
+            BoolArray::from_iter([false, true, true]),
+            &mut SESSION.create_execution_ctx()
+        );
+    }
+
+    #[test]
+    fn constant_predicate_skips_per_zone_evaluation() {
+        let zone_map = ZoneMap::try_new(
+            PType::U64.into(),
+            StructArray::try_new(FieldNames::empty(), vec![], 3, Validity::NonNullable).unwrap(),
+            Arc::new([]),
+            4,
+            10,
+        )
+        .unwrap();
+
+        // An empty list contains nothing, so the falsifier is `true` for every zone.
+        let empty_list = Scalar::list(
+            Arc::new(DType::Primitive(PType::U64, Nullability::NonNullable)),
+            vec![],
+            Nullability::NonNullable,
+        );
+        let expr = list_contains(lit(empty_list), root());
+        let pruning_expr = falsify(&expr, PType::U64.into());
+        let mask = zone_map.prune(&pruning_expr, &SESSION).unwrap();
+        assert_arrays_eq!(
+            mask.into_array(),
+            BoolArray::from_iter([true, true, true]),
+            &mut SESSION.create_execution_ctx()
+        );
     }
 
     #[test]

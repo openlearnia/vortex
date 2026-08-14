@@ -48,6 +48,7 @@ pub mod unstable;
 pub(crate) mod unstable;
 
 pub mod fns;
+pub mod internal;
 pub mod session;
 
 /// A unique identifier for a scalar function.
