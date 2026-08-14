@@ -12,16 +12,31 @@
 //! by a caller: zone-map field references, file-level stat literals, or typed nulls for missing
 //! stats. This lets all callers share the same falsification rules while keeping layout-specific
 //! stat storage behind [`StatBinder`].
+//!
+//! Binding is also where scope-level quantities enter the predicate. The boolean aggregates
+//! `all_null`, `all_non_null`, `all_nan`, and `all_non_nan` are derived from the corresponding
+//! count statistic when a binder does not store them directly, which for the "all" variants needs
+//! the number of rows the scope covers — see [`StatBinder::bind_row_count`].
 
 use vortex_error::VortexResult;
 
 use crate::aggregate_fn::AggregateFnRef;
+use crate::aggregate_fn::AggregateFnVTableExt;
+use crate::aggregate_fn::EmptyOptions;
+use crate::aggregate_fn::fns::all_nan::AllNan;
+use crate::aggregate_fn::fns::all_non_nan::AllNonNan;
+use crate::aggregate_fn::fns::all_non_null::AllNonNull;
+use crate::aggregate_fn::fns::all_null::AllNull;
+use crate::aggregate_fn::fns::nan_count::NanCount;
+use crate::aggregate_fn::fns::null_count::NullCount;
 use crate::dtype::DType;
 use crate::expr::BoundExpression;
+use crate::expr::bound::eq;
 use crate::expr::bound::lit;
 use crate::expr::traversal::NodeExt;
 use crate::expr::traversal::Transformed;
 use crate::scalar::Scalar;
+use crate::scalar_fn::fns::cast::Cast;
 use crate::scalar_fn::fns::stat::StatFn;
 
 /// A target that can bind abstract statistics to concrete expressions.
@@ -41,6 +56,15 @@ pub trait StatBinder {
         aggregate_fn: &AggregateFnRef,
         stat_dtype: &DType,
     ) -> VortexResult<Option<BoundExpression>>;
+
+    /// Bind the number of rows covered by each row of the stats scope.
+    ///
+    /// This backs the derivation of `all_null` and `all_nan` from their count statistics. It is an
+    /// expression rather than a scalar because a scope may cover a different number of rows per
+    /// row of its stats table: a zone map's final zone is often shorter than the rest.
+    ///
+    /// Implementations return `Ok(None)` when the row count is unknown.
+    fn bind_row_count(&self) -> VortexResult<Option<BoundExpression>>;
 
     /// Expression to use when a stat is unavailable.
     ///
@@ -83,7 +107,64 @@ fn bind_stat_fn(
     // `StatFn` has exactly one child: the expression the aggregate statistic is computed over.
     let input = expr.child(0);
 
-    binder.bind_aggregate(input, aggregate_fn, expr.dtype())
+    if let Some(bound) = binder.bind_aggregate(input, aggregate_fn, expr.dtype())? {
+        return Ok(Some(bound));
+    }
+
+    derive_from_count(input, aggregate_fn, binder)
+}
+
+/// The count statistic a boolean "all" aggregate is derived from, and whether the derivation
+/// compares it against the row count (`true`) or against zero (`false`).
+fn count_derivation(aggregate_fn: &AggregateFnRef) -> Option<(AggregateFnRef, bool)> {
+    if aggregate_fn.is::<AllNull>() {
+        Some((NullCount.bind(EmptyOptions), true))
+    } else if aggregate_fn.is::<AllNonNull>() {
+        Some((NullCount.bind(EmptyOptions), false))
+    } else if aggregate_fn.is::<AllNan>() {
+        Some((NanCount.bind(EmptyOptions), true))
+    } else if aggregate_fn.is::<AllNonNan>() {
+        Some((NanCount.bind(EmptyOptions), false))
+    } else {
+        None
+    }
+}
+
+/// Derive a boolean "all" aggregate from the count statistic a binder does store.
+///
+/// `all_null` holds exactly when every row is null, so it is `null_count == row_count`, and
+/// `all_non_null` is `null_count == 0`; the NaN variants are the same shape over `nan_count`.
+/// Binders that store the boolean aggregate directly answer from [`StatBinder::bind_aggregate`]
+/// and never reach here.
+fn derive_from_count(
+    input: &BoundExpression,
+    aggregate_fn: &AggregateFnRef,
+    binder: &(impl StatBinder + ?Sized),
+) -> VortexResult<Option<BoundExpression>> {
+    // A cast can change how many values are null or NaN, so a count over the cast input proves
+    // nothing about the cast output. The rewrite rules refuse to push counts through a cast for
+    // the same reason.
+    if input.is::<Cast>() {
+        return Ok(None);
+    }
+
+    let Some((count_fn, against_row_count)) = count_derivation(aggregate_fn) else {
+        return Ok(None);
+    };
+    let Some(count_dtype) = count_fn.state_dtype(input.dtype()) else {
+        return Ok(None);
+    };
+    let Some(count) = binder.bind_aggregate(input, &count_fn, &count_dtype.as_nullable())? else {
+        return Ok(None);
+    };
+
+    if !against_row_count {
+        return Ok(Some(eq(count, lit(0u64))));
+    }
+
+    Ok(binder
+        .bind_row_count()?
+        .map(|row_count| eq(count, row_count)))
 }
 
 fn null_expr(dtype: DType) -> VortexResult<BoundExpression> {
@@ -99,13 +180,16 @@ mod tests {
     use crate::dtype::PType;
     use crate::dtype::StructFields;
     use crate::expr::and;
+    use crate::expr::cast;
     use crate::expr::col;
+    use crate::expr::eq;
     use crate::expr::get_item;
     use crate::expr::is_null;
     use crate::expr::lit;
     use crate::expr::or;
     use crate::expr::root;
     use crate::expr::stats::Stat;
+    use crate::stats::all_nan;
     use crate::stats::all_non_nan;
     use crate::stats::nan_count;
 
@@ -113,6 +197,7 @@ mod tests {
         input_scope: DType,
         stats_scope: DType,
         bind_nan_count: bool,
+        row_count: Option<u64>,
     }
 
     impl TestBinder {
@@ -133,7 +218,13 @@ mod tests {
                     Nullability::NonNullable,
                 ),
                 bind_nan_count,
+                row_count: Some(10),
             }
+        }
+
+        fn without_row_count(mut self) -> Self {
+            self.row_count = None;
+            self
         }
     }
 
@@ -156,6 +247,12 @@ mod tests {
                 Ok(None)
             }
         }
+
+        fn bind_row_count(&self) -> VortexResult<Option<BoundExpression>> {
+            self.row_count
+                .map(|row_count| lit(row_count).bind(&self.stats_scope))
+                .transpose()
+        }
     }
 
     #[test]
@@ -169,8 +266,64 @@ mod tests {
     }
 
     #[test]
-    fn all_non_nan_does_not_derive_from_nan_count() -> VortexResult<()> {
+    fn all_non_nan_derives_from_nan_count() -> VortexResult<()> {
         let binder = TestBinder::new(true);
+
+        let bound = bind_stats(all_non_nan(col("f")).bind(&binder.input_scope)?, &binder)?;
+
+        assert_eq!(
+            bound,
+            eq(col("f_nan_count"), lit(0u64)).bind(&binder.stats_scope)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn all_nan_derives_from_nan_count_and_row_count() -> VortexResult<()> {
+        let binder = TestBinder::new(true);
+
+        let bound = bind_stats(all_nan(col("f")).bind(&binder.input_scope)?, &binder)?;
+
+        assert_eq!(
+            bound,
+            eq(col("f_nan_count"), lit(10u64)).bind(&binder.stats_scope)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn all_nan_is_missing_without_a_row_count() -> VortexResult<()> {
+        let binder = TestBinder::new(true).without_row_count();
+
+        let bound = bind_stats(all_nan(col("f")).bind(&binder.input_scope)?, &binder)?;
+
+        assert_eq!(
+            bound,
+            lit(Scalar::null(DType::Bool(Nullability::Nullable))).bind(&binder.stats_scope)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn all_non_nan_does_not_derive_through_a_cast() -> VortexResult<()> {
+        let binder = TestBinder::new(true);
+        let cast_dtype = DType::Primitive(PType::F64, Nullability::NonNullable);
+
+        let bound = bind_stats(
+            all_non_nan(cast(col("f"), cast_dtype)).bind(&binder.input_scope)?,
+            &binder,
+        )?;
+
+        assert_eq!(
+            bound,
+            lit(Scalar::null(DType::Bool(Nullability::Nullable))).bind(&binder.stats_scope)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn all_non_nan_is_missing_without_a_nan_count() -> VortexResult<()> {
+        let binder = TestBinder::new(false);
 
         let bound = bind_stats(all_non_nan(col("f")).bind(&binder.input_scope)?, &binder)?;
 

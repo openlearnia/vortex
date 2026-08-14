@@ -10,10 +10,6 @@ use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::aggregate_fn::AggregateFnRef;
 use vortex_array::aggregate_fn::AggregateFnSatisfaction;
-use vortex_array::aggregate_fn::fns::all_nan::AllNan;
-use vortex_array::aggregate_fn::fns::all_non_nan::AllNonNan;
-use vortex_array::aggregate_fn::fns::all_non_null::AllNonNull;
-use vortex_array::aggregate_fn::fns::all_null::AllNull;
 use vortex_array::aggregate_fn::fns::bounded_max::BOUNDED_MAX_BOUND;
 use vortex_array::aggregate_fn::fns::bounded_max::BoundedMax;
 use vortex_array::arrays::ConstantArray;
@@ -23,16 +19,9 @@ use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::dtype::DType;
 use vortex_array::expr::BoundExpression;
 use vortex_array::expr::Expression;
-use vortex_array::expr::eq;
 use vortex_array::expr::get_item;
-use vortex_array::expr::lit;
 use vortex_array::expr::root;
 use vortex_array::expr::stats::Stat;
-use vortex_array::scalar_fn::EmptyOptions;
-use vortex_array::scalar_fn::ScalarFnVTableExt;
-use vortex_array::scalar_fn::internal::row_count::RowCount;
-use vortex_array::scalar_fn::internal::row_count::contains_row_count;
-use vortex_array::scalar_fn::internal::row_count::substitute_row_count;
 use vortex_array::stats::bind::StatBinder;
 use vortex_array::stats::bind::bind_stats;
 use vortex_array::validity::Validity;
@@ -130,43 +119,72 @@ impl ZoneMap {
     /// `predicate` should be a stats rewrite expression such as the result of
     /// [`BoundExpression::falsify`]. The returned mask has one value per zone, where
     /// `true` means the zone cannot contain matching rows and can be skipped.
-    ///
-    /// If the predicate contains [`row_count`][vortex_array::scalar_fn::internal::row_count]
-    /// placeholders, they are replaced after [`ArrayRef::apply_bound`] with per-zone
-    /// counts derived from `zone_len` and `row_count`. Uniform zones use a
-    /// [`ConstantArray`]; a short final zone uses a run-end encoded array.
-    /// `row_count` is a layout property rather than a stored stats field, and the
-    /// final zone may be shorter than the nominal zone length, so it is materialized
-    /// only after the predicate has been lowered to the zone-map table.
     pub fn prune(
         &self,
         predicate: &BoundExpression,
         session: &VortexSession,
     ) -> VortexResult<Mask> {
         let mut ctx = session.create_execution_ctx();
-        let num_zones = self.array.len();
-        let predicate = self.lower_stats(predicate.clone())?;
+        let scope = self.pruning_scope()?;
+        let predicate = self.lower_stats(predicate.clone(), scope.dtype())?;
 
-        let array = self.array.clone().into_array();
-        let applied = array.apply_bound(&predicate)?;
-
-        if !contains_row_count(&applied) {
-            return applied.null_as_false().execute(&mut ctx);
-        }
-
-        let row_count_array = row_count_array(self.zone_len, self.row_count, num_zones)?;
-        let substituted = substitute_row_count(applied, &row_count_array)?;
-        substituted.null_as_false().execute(&mut ctx)
+        scope
+            .into_array()
+            .apply_bound(&predicate)?
+            .null_as_false()
+            .execute(&mut ctx)
     }
 
-    fn lower_stats(&self, predicate: BoundExpression) -> VortexResult<BoundExpression> {
-        let binder = ZoneMapStatsBinder { zone_map: self };
+    /// The scope that a lowered pruning predicate is evaluated against.
+    ///
+    /// This is the stored zone-map table plus a synthetic [`ROW_COUNT_FIELD`] column holding the
+    /// number of rows in each zone. The row count is a layout property rather than a stored stat,
+    /// and the final zone may be shorter than the nominal zone length, so it cannot be bound to a
+    /// literal. Materializing it costs nothing: uniform zones use a [`ConstantArray`] and a short
+    /// final zone uses a two-run run-end encoded array.
+    fn pruning_scope(&self) -> VortexResult<StructArray> {
+        let num_zones = self.array.len();
+        let names = self
+            .array
+            .names()
+            .iter()
+            .cloned()
+            .chain([ROW_COUNT_FIELD.into()]);
+        let fields = self
+            .array
+            .iter_unmasked_fields()
+            .cloned()
+            .chain([row_count_array(self.zone_len, self.row_count, num_zones)?]);
+
+        StructArray::try_new(
+            names.collect(),
+            fields,
+            num_zones,
+            self.array.struct_validity(),
+        )
+    }
+
+    fn lower_stats(
+        &self,
+        predicate: BoundExpression,
+        scope_dtype: &DType,
+    ) -> VortexResult<BoundExpression> {
+        let binder = ZoneMapStatsBinder {
+            zone_map: self,
+            scope_dtype,
+        };
         bind_stats(predicate, &binder)
     }
 }
 
+/// Name of the synthetic per-zone row-count column added by [`ZoneMap::pruning_scope`].
+///
+/// The `$` prefix cannot collide with a stat name or an aggregate function's display name.
+const ROW_COUNT_FIELD: &str = "$row_count";
+
 struct ZoneMapStatsBinder<'a> {
     zone_map: &'a ZoneMap,
+    scope_dtype: &'a DType,
 }
 
 impl StatBinder for ZoneMapStatsBinder<'_> {
@@ -190,38 +208,8 @@ impl StatBinder for ZoneMapStatsBinder<'_> {
             return Ok(Some(self.bind_target(stat_expr)?));
         }
 
-        if aggregate_fn.is::<AllNull>() {
-            return self
-                .zone_map
-                .stat_field_expr(Stat::NullCount)
-                .map(|null_count| self.bind_target(eq(null_count, row_count_expr())))
-                .transpose();
-        }
-
-        if aggregate_fn.is::<AllNonNull>() {
-            return self
-                .zone_map
-                .stat_field_expr(Stat::NullCount)
-                .map(|null_count| self.bind_target(eq(null_count, lit(0u64))))
-                .transpose();
-        }
-
-        if aggregate_fn.is::<AllNan>() {
-            return self
-                .zone_map
-                .stat_field_expr(Stat::NaNCount)
-                .map(|nan_count| self.bind_target(eq(nan_count, row_count_expr())))
-                .transpose();
-        }
-
-        if aggregate_fn.is::<AllNonNan>() {
-            return self
-                .zone_map
-                .stat_field_expr(Stat::NaNCount)
-                .map(|nan_count| self.bind_target(eq(nan_count, lit(0u64))))
-                .transpose();
-        }
-
+        // The boolean `all_null` / `all_nan` family is derived from the count stats by
+        // `bind_stats`, using `bind_row_count` below.
         if let Some(stat) = Stat::from_aggregate_fn(aggregate_fn) {
             return self
                 .zone_map
@@ -232,11 +220,16 @@ impl StatBinder for ZoneMapStatsBinder<'_> {
 
         Ok(None)
     }
+
+    fn bind_row_count(&self) -> VortexResult<Option<BoundExpression>> {
+        self.bind_target(get_item(ROW_COUNT_FIELD, root()))
+            .map(Some)
+    }
 }
 
 impl ZoneMapStatsBinder<'_> {
     fn bind_target(&self, expr: Expression) -> VortexResult<BoundExpression> {
-        expr.bind(self.zone_map.array.dtype())
+        expr.bind(self.scope_dtype)
     }
 }
 
@@ -296,10 +289,6 @@ fn aggregate_result_expr(stored: &AggregateFnRef, state_expr: Expression) -> Exp
     } else {
         state_expr
     }
-}
-
-fn row_count_expr() -> Expression {
-    RowCount.new_expr(EmptyOptions, [])
 }
 
 /// Build per-zone row counts for a zone map.
@@ -560,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn row_count_substitution_handles_empty_zone_map() {
+    fn pruning_handles_empty_zone_map() {
         let zone_map = ZoneMap::try_new_legacy(
             PType::U64.into(),
             StructArray::from_fields(&[(

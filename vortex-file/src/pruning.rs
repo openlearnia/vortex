@@ -5,7 +5,6 @@ use vortex_array::Canonical;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::aggregate_fn::AggregateFnRef;
-use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::NullArray;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldPath;
@@ -17,7 +16,6 @@ use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::fns::cast::Cast;
 use vortex_array::scalar_fn::fns::get_item::GetItem;
 use vortex_array::scalar_fn::fns::literal::Literal;
-use vortex_array::scalar_fn::internal::row_count::substitute_row_count;
 use vortex_array::stats::bind::StatBinder;
 use vortex_array::stats::bind::bind_stats;
 use vortex_error::VortexResult;
@@ -39,6 +37,7 @@ pub(crate) fn can_prune_file_stats(
     let binder = FileStatsBinder {
         file_stats,
         struct_fields,
+        row_count,
     };
     let pruning_expr = bind_stats(pruning_expr, &binder)?;
 
@@ -47,8 +46,6 @@ pub(crate) fn can_prune_file_stats(
     }
 
     let pruning = NullArray::new(1).into_array().apply_bound(&pruning_expr)?;
-    let row_count_replacement = ConstantArray::new(row_count, pruning.len()).into_array();
-    let pruning = substitute_row_count(pruning, &row_count_replacement)?;
 
     let mut ctx = session.create_execution_ctx();
     let result = pruning
@@ -63,6 +60,7 @@ pub(crate) fn can_prune_file_stats(
 struct FileStatsBinder<'a> {
     file_stats: &'a FileStatistics,
     struct_fields: &'a StructFields,
+    row_count: u64,
 }
 
 impl StatBinder for FileStatsBinder<'_> {
@@ -79,6 +77,11 @@ impl StatBinder for FileStatsBinder<'_> {
             return Ok(None);
         };
         Ok(self.stat_ref(&field_path, stat))
+    }
+
+    /// File statistics cover the whole file, so every row of this scope covers `row_count` rows.
+    fn bind_row_count(&self) -> VortexResult<Option<BoundExpression>> {
+        Ok(Some(lit(self.row_count)))
     }
 }
 

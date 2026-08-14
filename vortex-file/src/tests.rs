@@ -47,6 +47,8 @@ use vortex_array::expr::eq;
 use vortex_array::expr::get_item;
 use vortex_array::expr::gt;
 use vortex_array::expr::gt_eq;
+use vortex_array::expr::is_not_null;
+use vortex_array::expr::is_null;
 use vortex_array::expr::lit;
 use vortex_array::expr::lt;
 use vortex_array::expr::lt_eq;
@@ -2717,6 +2719,47 @@ async fn test_can_prune_composite_predicates() -> VortexResult<()> {
     assert!(!file.can_prune(&gt(col("age"), lit(20)))?);
     assert!(!file.can_prune(&eq(col("age"), lit(18)))?);
     assert!(!file.can_prune(&and(gt(col("age"), lit(20)), gt(col("price"), lit(100))))?);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn test_can_prune_null_predicates() -> VortexResult<()> {
+    // File stats only store `null_count`, so `all_null` and `all_non_null` must be derived from
+    // it during stat binding. `all_null` additionally needs the file's row count.
+    let st = StructArray::from_fields(&[
+        (
+            "never_null",
+            PrimitiveArray::from_option_iter([Some(1i32), Some(2), Some(3)]).into_array(),
+        ),
+        (
+            "always_null",
+            PrimitiveArray::from_option_iter::<i32, _>([None, None, None]).into_array(),
+        ),
+        (
+            "sometimes_null",
+            PrimitiveArray::from_option_iter([Some(1i32), None, Some(3)]).into_array(),
+        ),
+    ])?;
+    let mut buf = ByteBufferMut::empty();
+    SESSION
+        .write_options()
+        .write(&mut buf, st.into_array().to_array_stream())
+        .await?;
+    let file = SESSION.open_options().open_buffer(buf)?;
+
+    // `null_count == 0` proves no row is null.
+    assert!(file.can_prune(&is_null(col("never_null")))?);
+    assert!(!file.can_prune(&is_not_null(col("never_null")))?);
+
+    // `null_count == row_count` proves every row is null.
+    assert!(file.can_prune(&is_not_null(col("always_null")))?);
+    assert!(!file.can_prune(&is_null(col("always_null")))?);
+
+    // Mixed nullability proves nothing either way.
+    assert!(!file.can_prune(&is_null(col("sometimes_null")))?);
+    assert!(!file.can_prune(&is_not_null(col("sometimes_null")))?);
 
     Ok(())
 }
