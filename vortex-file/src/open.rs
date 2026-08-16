@@ -75,6 +75,8 @@ pub struct VortexOpenOptions {
     labels: Vec<Label>,
     /// Whether to cache file's LayoutReader between scans
     cache_layout_reader: bool,
+    /// Optional AES-GCM key for decrypting encrypted segments.
+    encryption_key: Option<crate::encryption::SegmentEncryptionKey>,
 }
 
 /// Extension trait for constructing [`VortexOpenOptions`] from a session.
@@ -94,6 +96,7 @@ pub trait OpenOptionsSessionExt:
             metrics_registry: None,
             labels: Vec::default(),
             cache_layout_reader: false,
+            encryption_key: None,
         }
     }
 }
@@ -202,6 +205,12 @@ impl VortexOpenOptions {
         self
     }
 
+    /// Decrypt AES-GCM encrypted segments with the provided key.
+    pub fn with_encryption_key(mut self, key: crate::encryption::SegmentEncryptionKey) -> Self {
+        self.encryption_key = Some(key);
+        self
+    }
+
     /// Configure a custom [`MetricsRegistry`] implementation.
     pub fn with_metrics_registry(mut self, metrics: Arc<dyn MetricsRegistry>) -> Self {
         self.metrics_registry = Some(metrics);
@@ -260,10 +269,17 @@ impl VortexOpenOptions {
         };
         footer.validate_file_size(buffer.len() as u64)?;
 
-        let segment_source: Arc<dyn SegmentSource> = Arc::new(BufferSegmentSource::new(
+        let mut segment_source: Arc<dyn SegmentSource> = Arc::new(BufferSegmentSource::new(
             buffer,
             footer.segment_specs_with_metadata(),
         ));
+        if let Some(key) = opts.encryption_key.clone() {
+            segment_source = Arc::new(crate::segments::DecryptingSegmentSource::new(
+                segment_source,
+                footer.segment_specs_with_metadata(),
+                key,
+            ));
+        }
         let metadata = if include_metadata {
             block_on(resolve_metadata(&footer, Arc::clone(&segment_source)))?
         } else {
@@ -326,10 +342,17 @@ impl VortexOpenOptions {
         )));
 
         // Wrap up the segment source to first resolve segments from the initial read cache.
-        let segment_source: Arc<dyn SegmentSource> = Arc::new(SegmentCacheSourceAdapter::new(
+        let mut segment_source: Arc<dyn SegmentSource> = Arc::new(SegmentCacheSourceAdapter::new(
             segment_cache,
             segment_source,
         ));
+        if let Some(key) = self.encryption_key.clone() {
+            segment_source = Arc::new(crate::segments::DecryptingSegmentSource::new(
+                segment_source,
+                footer.segment_specs_with_metadata(),
+                key,
+            ));
+        }
 
         let metadata = if self.include_metadata {
             resolve_metadata(&footer, Arc::clone(&segment_source)).await?
@@ -819,6 +842,7 @@ mod tests {
             offset: 0,
             length: 1024,
             alignment: Alignment::none(),
+            encryption: 0,
         }]);
         let bad_footer = Footer::new(
             Arc::clone(footer.layout()),

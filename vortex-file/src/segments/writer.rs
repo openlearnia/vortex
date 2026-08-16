@@ -15,20 +15,29 @@ use vortex_layout::segments::SegmentId;
 use vortex_layout::segments::SegmentSink;
 use vortex_layout::sequence::SequenceId;
 
+use crate::encryption::AES_GCM_SPEC_INDEX;
+use crate::encryption::SegmentEncryptionKey;
+use crate::encryption::encrypt_segment;
 use crate::footer::SegmentSpec;
 
 pub struct BufferedSegmentSink {
     buffers: kanal::AsyncSender<ByteBuffer>,
     byte_offset: AtomicU64,
     segment_specs: Mutex<Vec<SegmentSpec>>,
+    encryption_key: Option<SegmentEncryptionKey>,
 }
 
 impl BufferedSegmentSink {
-    pub fn new(send: kanal::AsyncSender<ByteBuffer>, byte_offset: u64) -> Self {
+    pub fn with_encryption(
+        send: kanal::AsyncSender<ByteBuffer>,
+        byte_offset: u64,
+        encryption_key: Option<SegmentEncryptionKey>,
+    ) -> Self {
         Self {
             buffers: send,
             byte_offset: AtomicU64::new(byte_offset),
             segment_specs: Default::default(),
+            encryption_key,
         }
     }
 
@@ -50,49 +59,64 @@ impl SegmentSink for BufferedSegmentSink {
         // reference to this one, we essentially have an exclusive lock on the segment writer.
         sequence_id.collapse().await;
 
-        let (segment_id, padding_buffer) = {
+        let (segment_id, padding_buffer, out_buffers) = {
             let mut specs = self.segment_specs.lock();
-            let segment_id = SegmentId::from(
-                u32::try_from(specs.len())
-                    .map_err(|_| vortex_err!("Too mant segments, u32 overflow"))?,
-            );
+            let segment_id_u32 = u32::try_from(specs.len())
+                .map_err(|_| vortex_err!("Too mant segments, u32 overflow"))?;
+            let segment_id = SegmentId::from(segment_id_u32);
 
             // The API requires us to write these buffers contiguously. Therefore, we can only
             // respect the alignment of the first one.
-            // Don't worry, in most cases the caller knows what they're doing and will align the
-            // buffers themselves, inserting padding buffers where necessary.
             let alignment = buffers
                 .first()
                 .map(|buffer| buffer.alignment())
                 .unwrap_or_else(Alignment::none);
-            let length = u32::try_from(buffers.iter().map(|buffer| buffer.len()).sum::<usize>())
-                .map_err(|_| vortex_err!("segment buffer length exceeds maximum u32"))?;
 
-            // Add any padding required to align the segment.
             let byte_offset = self.byte_offset.load(Ordering::Relaxed);
             let padding = byte_offset.next_multiple_of(*alignment as u64) - byte_offset;
             let offset = byte_offset + padding;
+
+            let (out_buffers, length, encryption) = if let Some(key) = &self.encryption_key {
+                let mut plain = Vec::new();
+                for buffer in &buffers {
+                    plain.extend_from_slice(buffer.as_slice());
+                }
+                let encrypted = encrypt_segment(key, &plain, offset, segment_id_u32)?;
+                let length = u32::try_from(encrypted.len())
+                    .map_err(|_| vortex_err!("segment buffer length exceeds maximum u32"))?;
+                (vec![encrypted], length, AES_GCM_SPEC_INDEX)
+            } else {
+                let length =
+                    u32::try_from(buffers.iter().map(|buffer| buffer.len()).sum::<usize>())
+                        .map_err(|_| vortex_err!("segment buffer length exceeds maximum u32"))?;
+                (buffers, length, 0)
+            };
+
             specs.push(SegmentSpec {
                 offset,
                 length,
                 alignment,
+                encryption,
             });
 
             self.byte_offset
                 .store(byte_offset + padding + u64::from(length), Ordering::Relaxed);
 
-            // Send the buffers to the stream.
             if padding > 0 {
-                (segment_id, Some(ByteBuffer::zeroed(padding as usize)))
+                (
+                    segment_id,
+                    Some(ByteBuffer::zeroed(padding as usize)),
+                    out_buffers,
+                )
             } else {
-                (segment_id, None)
+                (segment_id, None, out_buffers)
             }
         };
 
         if let Some(padding) = padding_buffer {
             let _ = self.buffers.send(padding).await;
         }
-        for buffer in buffers {
+        for buffer in out_buffers {
             let _ = self.buffers.send(buffer).await;
         }
 

@@ -271,6 +271,7 @@ mod tests {
             offset,
             length,
             alignment: Alignment::none(),
+            encryption: 0,
         }
     }
 

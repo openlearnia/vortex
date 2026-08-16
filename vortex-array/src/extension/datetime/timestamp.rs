@@ -6,7 +6,6 @@
 use std::fmt;
 use std::sync::Arc;
 
-use jiff::Span;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -91,13 +90,24 @@ pub enum TimestampValue<'a> {
 
 impl fmt::Display for TimestampValue<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (span, tz) = match self {
-            TimestampValue::Seconds(v, tz) => (Span::new().seconds(*v), *tz),
-            TimestampValue::Milliseconds(v, tz) => (Span::new().milliseconds(*v), *tz),
-            TimestampValue::Microseconds(v, tz) => (Span::new().microseconds(*v), *tz),
-            TimestampValue::Nanoseconds(v, tz) => (Span::new().nanoseconds(*v), *tz),
+        let (raw, unit, tz) = match self {
+            TimestampValue::Seconds(v, tz) => (*v, TimeUnit::Seconds, *tz),
+            TimestampValue::Milliseconds(v, tz) => (*v, TimeUnit::Milliseconds, *tz),
+            TimestampValue::Microseconds(v, tz) => (*v, TimeUnit::Microseconds, *tz),
+            TimestampValue::Nanoseconds(v, tz) => (*v, TimeUnit::Nanoseconds, *tz),
         };
-        let ts = jiff::Timestamp::UNIX_EPOCH + span;
+        if raw == i64::MAX {
+            return f.write_str("infinity");
+        }
+        if raw == i64::MIN {
+            return f.write_str("-infinity");
+        }
+        let Ok(span) = unit.to_jiff_span(raw) else {
+            return write!(f, "{raw}{unit}");
+        };
+        let Ok(ts) = jiff::Timestamp::UNIX_EPOCH.checked_add(span) else {
+            return write!(f, "{raw}{unit}");
+        };
 
         match tz {
             None => write!(f, "{ts}"),
@@ -226,33 +236,20 @@ impl ExtVTable for Timestamp {
         let ts_value = storage_value.as_primitive().cast::<i64>()?;
         let tz = metadata.tz.as_ref();
 
-        let (span, value) = match metadata.unit {
-            TimeUnit::Nanoseconds => (
-                Span::new().nanoseconds(ts_value),
-                TimestampValue::Nanoseconds(ts_value, tz),
-            ),
-            TimeUnit::Microseconds => (
-                Span::new().microseconds(ts_value),
-                TimestampValue::Microseconds(ts_value, tz),
-            ),
-            TimeUnit::Milliseconds => (
-                Span::new().milliseconds(ts_value),
-                TimestampValue::Milliseconds(ts_value, tz),
-            ),
-            TimeUnit::Seconds => (
-                Span::new().seconds(ts_value),
-                TimestampValue::Seconds(ts_value, tz),
-            ),
+        let value = match metadata.unit {
+            TimeUnit::Nanoseconds => TimestampValue::Nanoseconds(ts_value, tz),
+            TimeUnit::Microseconds => TimestampValue::Microseconds(ts_value, tz),
+            TimeUnit::Milliseconds => TimestampValue::Milliseconds(ts_value, tz),
+            TimeUnit::Seconds => TimestampValue::Seconds(ts_value, tz),
             TimeUnit::Days => vortex_bail!("Timestamp does not support Days time unit"),
         };
-
-        // Validate the storage value is within the valid range for Timestamp.
-        let ts = jiff::Timestamp::UNIX_EPOCH
-            .checked_add(span)
-            .map_err(|e| vortex_err!("Invalid timestamp scalar: {}", e))?;
+        // DuckDB and Arrow reserve the i64 extrema as timestamp infinities.
+        if matches!(ts_value, i64::MIN | i64::MAX) {
+            return Ok(value);
+        }
 
         if let Some(tz) = tz {
-            ts.in_tz(tz.as_ref())
+            jiff::tz::TimeZone::get(tz.as_ref())
                 .map_err(|e| vortex_err!("Invalid timezone for timestamp scalar: {}", e))?;
         }
 
@@ -279,6 +276,29 @@ mod tests {
         let dtype = DType::Extension(Timestamp::new(TimeUnit::Seconds, Nullable).erased());
         Scalar::try_new(dtype, Some(ScalarValue::Primitive(PValue::I64(0))))?;
 
+        Ok(())
+    }
+
+    #[test]
+    fn validate_full_range_timestamp_scalars() -> VortexResult<()> {
+        let dtype = DType::Extension(Timestamp::new(TimeUnit::Microseconds, Nullable).erased());
+        let positive = Scalar::try_new(
+            dtype.clone(),
+            Some(ScalarValue::Primitive(PValue::I64(i64::MAX))),
+        )?;
+        let negative = Scalar::try_new(dtype, Some(ScalarValue::Primitive(PValue::I64(i64::MIN))))?;
+
+        assert_eq!(format!("{}", positive.as_extension()), "infinity");
+        assert_eq!(format!("{}", negative.as_extension()), "-infinity");
+
+        let finite_extreme = Scalar::try_new(
+            DType::Extension(Timestamp::new(TimeUnit::Microseconds, Nullable).erased()),
+            Some(ScalarValue::Primitive(PValue::I64(i64::MAX - 1))),
+        )?;
+        assert_eq!(
+            format!("{}", finite_extreme.as_extension()),
+            "9223372036854775806µs"
+        );
         Ok(())
     }
 

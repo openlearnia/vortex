@@ -104,8 +104,10 @@
 //! are available. [`VortexOpenOptions`] drives this state machine for ordinary file opens.
 
 mod counting;
+mod encryption;
 mod file;
 mod footer;
+
 pub mod multi;
 mod open;
 mod pruning;
@@ -120,6 +122,7 @@ pub mod v2;
 mod writer;
 
 pub use counting::CountingVortexWrite;
+pub use encryption::SegmentEncryptionKey;
 pub use file::*;
 pub use footer::*;
 pub use forever_constant::*;

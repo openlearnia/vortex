@@ -188,6 +188,7 @@ impl FooterDeserializer {
                     offset: metadata.segment.offset,
                     length: metadata.segment.length,
                     alignment: metadata.segment.alignment,
+                    encryption: 0,
                 };
                 let end = segment
                     .offset

@@ -60,8 +60,23 @@ pub enum TimeValue {
     Nanoseconds(i64),
 }
 
+impl TimeValue {
+    fn is_terminal_24_hour(&self) -> bool {
+        matches!(
+            self,
+            TimeValue::Seconds(86_400)
+                | TimeValue::Milliseconds(86_400_000)
+                | TimeValue::Microseconds(86_400_000_000)
+                | TimeValue::Nanoseconds(86_400_000_000_000)
+        )
+    }
+}
+
 impl fmt::Display for TimeValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_terminal_24_hour() {
+            return f.write_str("24:00:00");
+        }
         let min = jiff::civil::Time::MIN;
 
         let time = match self {
@@ -159,6 +174,9 @@ impl ExtVTable for Time {
             ),
             d @ TimeUnit::Days => vortex_bail!("Time type does not support time unit {d}"),
         };
+        if value.is_terminal_24_hour() {
+            return Ok(value);
+        }
 
         // Validate the storage value is within the valid range for Time.
         jiff::civil::Time::MIN
@@ -191,11 +209,18 @@ mod tests {
     }
 
     #[test]
-    fn reject_time_out_of_range() {
-        // 86400 seconds = exactly 24 hours, which exceeds the valid `jiff::civil::Time` range.
+    fn accept_terminal_24_hour_time_but_reject_later_values() -> VortexResult<()> {
+        // SQL and DuckDB permit 24:00:00 as the terminal time-of-day value.
         let dtype = DType::Extension(Time::new(TimeUnit::Seconds, Nullable).erased());
-        let result = Scalar::try_new(dtype, Some(ScalarValue::Primitive(PValue::I32(86400))));
+        let terminal = Scalar::try_new(
+            dtype.clone(),
+            Some(ScalarValue::Primitive(PValue::I32(86_400))),
+        )?;
+        assert_eq!(format!("{}", terminal.as_extension()), "24:00:00");
+
+        let result = Scalar::try_new(dtype, Some(ScalarValue::Primitive(PValue::I32(86_401))));
         assert!(result.is_err());
+        Ok(())
     }
 
     #[test]

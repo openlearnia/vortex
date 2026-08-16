@@ -14,6 +14,7 @@ use vortex::expr::stats::Stat;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::file::VortexFile;
 use vortex::io::runtime::BlockingRuntime;
+use vortex::io::session::RuntimeSessionExt;
 
 use crate::copy::scalar_value_to_stats_string;
 use crate::duckdb::LogicalType;
@@ -249,12 +250,22 @@ fn build_column_stats(file: &VortexFile) -> VortexResult<Vec<ColumnStat>> {
 
 pub fn open_full_metadata(path: &str) -> VortexResult<FullMetadata> {
     RUNTIME.block_on(async {
-        let file_size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        let mut options = SESSION.open_options().include_metadata();
-        if file_size_bytes > 0 {
-            options = options.with_file_size(file_size_bytes);
-        }
-        let file = options.open_path(path).await?;
+        use std::sync::Arc;
+
+        use vortex::io::VortexReadAt;
+        use vortex::io::std_file::FileReadAt;
+
+        // Prefer VortexReadAt::size over std::fs::metadata so non-local openable
+        // paths (and races where metadata fails) still report a real byte length.
+        // ponytail: FileReadAt is local-fs only; object-store URIs need ObjectStoreReadAt.
+        let source = Arc::new(FileReadAt::open(path, SESSION.handle())?);
+        let file_size_bytes = source.size().await?;
+        let file = SESSION
+            .open_options()
+            .include_metadata()
+            .with_file_size(file_size_bytes)
+            .open(source)
+            .await?;
         Ok(FullMetadata {
             file_name: path.to_owned(),
             num_rows: file.row_count(),

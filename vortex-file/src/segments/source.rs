@@ -375,6 +375,7 @@ impl SegmentSource for FileSegmentSource {
             offset,
             length,
             alignment,
+            encryption: _,
         } = spec;
 
         let (send, recv) = oneshot::channel();
@@ -632,6 +633,7 @@ mod tests {
             offset: 0,
             length: 4,
             alignment: Alignment::none(),
+            encryption: 0,
         }]);
         let metrics = DefaultMetricsRegistry::default();
         FileSegmentSource::open(
@@ -770,6 +772,7 @@ mod tests {
                 offset: i * 4,
                 length: 4,
                 alignment: Alignment::none(),
+                encryption: 0,
             })
             .collect();
         let metrics = DefaultMetricsRegistry::default();
@@ -861,6 +864,7 @@ mod tests {
                 offset: i * 4,
                 length: 4,
                 alignment: Alignment::none(),
+                encryption: 0,
             })
             .collect();
         let metrics = DefaultMetricsRegistry::default();
@@ -921,6 +925,7 @@ mod tests {
                 offset: i * 4,
                 length: 4,
                 alignment: Alignment::none(),
+                encryption: 0,
             })
             .collect();
         let metrics = DefaultMetricsRegistry::default();
@@ -1020,6 +1025,7 @@ mod tests {
                 offset: u64::from(i) * 4,
                 length: 4,
                 alignment: Alignment::none(),
+                encryption: 0,
             })
             .collect();
         let metrics = DefaultMetricsRegistry::default();

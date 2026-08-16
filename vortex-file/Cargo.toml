@@ -17,6 +17,8 @@ version = { workspace = true }
 all-features = true
 
 [dependencies]
+aes-gcm = { workspace = true }
+getrandom = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }

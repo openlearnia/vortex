@@ -60,6 +60,7 @@ use crate::Footer;
 use crate::MAGIC_BYTES;
 use crate::WriteStrategyBuilder;
 use crate::counting::CountingVortexWrite;
+use crate::encryption::SegmentEncryptionKey;
 use crate::footer::FileStatistics;
 use crate::footer::MAX_METADATA_KEY_BYTES;
 use crate::footer::MAX_METADATA_SEGMENTS;
@@ -82,6 +83,7 @@ pub struct VortexWriteOptions {
     max_variable_length_statistics_size: usize,
     file_statistics: Vec<Stat>,
     metadata: HashMap<String, ByteBuffer>,
+    encryption_key: Option<SegmentEncryptionKey>,
 }
 
 /// Extension trait for constructing [`VortexWriteOptions`] from a session.
@@ -112,6 +114,7 @@ impl VortexWriteOptions {
             file_statistics: PRUNING_STATS.to_vec(),
             max_variable_length_statistics_size: 64,
             metadata: HashMap::default(),
+            encryption_key: None,
         }
     }
 
@@ -187,6 +190,12 @@ impl VortexWriteOptions {
     pub fn validate_metadata(&self) -> VortexResult<()> {
         validate_metadata_segments(&self.metadata)
     }
+
+    /// Enable segment-level AES-GCM encryption with the provided key (16 or 32 bytes).
+    pub fn with_encryption_key(mut self, key: SegmentEncryptionKey) -> Self {
+        self.encryption_key = Some(key);
+        self
+    }
 }
 
 impl VortexWriteOptions {
@@ -256,7 +265,11 @@ impl VortexWriteOptions {
         // Create a channel to send buffers from the segment sink to the output stream.
         let (send, recv) = kanal::bounded_async(1);
 
-        let segments = Arc::new(BufferedSegmentSink::new(send, position));
+        let segments = Arc::new(BufferedSegmentSink::with_encryption(
+            send,
+            position,
+            self.encryption_key.clone(),
+        ));
 
         // We spawn the layout future so it is driven in the background while we write the
         // buffer stream, so we don't need to poll it until all buffers have been drained.

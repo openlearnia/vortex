@@ -120,6 +120,10 @@ table CompressionSpec {
 }
 
 table EncryptionSpec {
+    /// Algorithm identifier. 0 = unencrypted/legacy, 1 = AES-256-GCM.
+    algorithm: uint8 = 0;
+    /// Spec version for the chosen algorithm (AES-GCM starts at 1).
+    version: uint8 = 0;
 }
 // [footer]
 

@@ -205,6 +205,7 @@ impl From<&PostscriptSegment> for SegmentSpec {
             offset: value.offset,
             length: value.length,
             alignment: value.alignment,
+            encryption: 0,
         }
     }
 }
