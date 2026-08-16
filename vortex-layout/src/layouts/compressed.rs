@@ -9,6 +9,7 @@ use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::VortexSessionExecute;
 use vortex_array::expr::stats::Stat;
+use vortex_array::stats::PRUNING_STATS;
 use vortex_btrblocks::BtrBlocksCompressor;
 use vortex_error::VortexResult;
 use vortex_io::session::RuntimeSessionExt;
@@ -67,7 +68,7 @@ impl CompressingStrategy {
         Self {
             child: Arc::new(child),
             compressor: Arc::new(compressor),
-            stats: Stat::all().collect(),
+            stats: PRUNING_STATS.into(),
             concurrency: get_available_parallelism().unwrap_or(1),
         }
     }
@@ -78,7 +79,7 @@ impl CompressingStrategy {
     }
 
     /// Override the set of statistics computed on each chunk before compression.
-    /// Defaults to `Stat::all()`.
+    /// Defaults to [`PRUNING_STATS`].
     pub fn with_stats(mut self, stats: &[Stat]) -> Self {
         self.stats = stats.into();
         self
@@ -126,5 +127,22 @@ impl LayoutStrategy for CompressingStrategy {
                 &session,
             )
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vortex_array::stats::PRUNING_STATS;
+    use vortex_btrblocks::BtrBlocksCompressor;
+
+    use super::*;
+    use crate::layouts::flat::writer::FlatLayoutStrategy;
+
+    #[test]
+    fn compression_defaults_to_pruning_stats() {
+        let strategy =
+            CompressingStrategy::new(FlatLayoutStrategy::default(), BtrBlocksCompressor::default());
+
+        assert_eq!(strategy.stats.as_ref(), PRUNING_STATS);
     }
 }

@@ -10,7 +10,11 @@ use vortex_array::ArrayId;
 use vortex_array::dtype::FieldPath;
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_btrblocks::SchemeExt;
+use vortex_btrblocks::schemes::float::ALPRDScheme;
+use vortex_btrblocks::schemes::float::FloatRLEScheme;
 use vortex_btrblocks::schemes::integer::IntDictScheme;
+use vortex_btrblocks::schemes::integer::IntRLEScheme;
+use vortex_btrblocks::schemes::integer::RunEndScheme;
 use vortex_error::VortexExpect;
 use vortex_layout::LayoutStrategy;
 use vortex_layout::LayoutStrategyEncodingValidator;
@@ -173,6 +177,26 @@ impl WriteStrategyBuilder {
         self
     }
 
+    /// Tune the default pipeline for high-ingest writers (e.g. DuckDB `COPY`).
+    ///
+    /// Drops schemes that rarely win on flat analytics tables but still pay sample-compress
+    /// cost, and coalesces toward 2 MiB uncompressed blocks so FSST/BtrBlocks run less often.
+    /// Keeps FSST and dictionary schemes that dominate TPC-H string columns.
+    ///
+    /// Not wired as the DuckDB COPY default yet: SF1 isolated CTAS stayed ~1.38× Parquet with
+    /// this preset (FSST encode dominates), while bytes grew ~1%.
+    pub fn for_ingest(self) -> Self {
+        self.with_btrblocks_builder(
+            BtrBlocksCompressorBuilder::default().exclude_schemes([
+                RunEndScheme.id(),
+                IntRLEScheme.id(),
+                ALPRDScheme.id(),
+                FloatRLEScheme.id(),
+            ]),
+        )
+        .with_data_block_target_bytes(Some(2 * ONE_MEG))
+    }
+
     /// Builds the canonical [`LayoutStrategy`] implementation, with the configured overrides
     /// applied.
     pub fn build(self) -> Arc<dyn LayoutStrategy> {
@@ -318,5 +342,17 @@ impl WriteStrategyBuilder {
         }
 
         Arc::new(table_strategy)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn for_ingest_uses_two_megabyte_blocks() {
+        let builder = WriteStrategyBuilder::default().for_ingest();
+        assert_eq!(builder.data_block_target_bytes, Some(2 * ONE_MEG));
+        assert_eq!(builder.row_block_size, 8192);
     }
 }
