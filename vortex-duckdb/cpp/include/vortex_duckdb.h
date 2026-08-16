@@ -40,6 +40,7 @@ duckdb_logical_type duckdb_vx_logical_type_copy(duckdb_logical_type ty);
 /// Creates a GEOMETRY logical type with the given CRS (Coordinate Reference System).
 /// `crs` must be a NUL-terminated UTF-8 string. Pass an empty string for no CRS.
 duckdb_logical_type duckdb_vx_create_geometry(const char *crs);
+duckdb_logical_type duckdb_vx_create_variant();
 
 duckdb_state duckdb_vx_register_scan_replacement(duckdb_database duckdb_database);
 

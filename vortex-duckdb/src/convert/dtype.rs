@@ -34,6 +34,7 @@ use std::sync::Arc;
 use vortex::array::dtype::extension::ExtDType;
 use vortex::dtype::DType;
 use vortex::dtype::DecimalDType;
+use vortex::dtype::FieldNames;
 use vortex::dtype::Nullability;
 use vortex::dtype::PType;
 use vortex::dtype::PType::F32;
@@ -47,6 +48,7 @@ use vortex::dtype::PType::U16;
 use vortex::dtype::PType::U32;
 use vortex::dtype::PType::U64;
 use vortex::dtype::StructFields;
+use vortex::dtype::UnionVariants;
 use vortex::error::VortexError;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
@@ -57,6 +59,8 @@ use vortex::extension::datetime::TemporalMetadata;
 use vortex::extension::datetime::Time;
 use vortex::extension::datetime::TimeUnit;
 use vortex::extension::datetime::Timestamp;
+use vortex::extension::uuid::Uuid;
+use vortex::extension::uuid::UuidMetadata;
 use vortex_spatial::extension::LineString;
 use vortex_spatial::extension::MultiLineString;
 use vortex_spatial::extension::MultiPoint;
@@ -70,6 +74,19 @@ use vortex_utils::aliases::hash_set::HashSet;
 use crate::cpp::DUCKDB_TYPE;
 use crate::duckdb::LogicalType;
 use crate::duckdb::LogicalTypeRef;
+
+const UUID_BYTE_LEN: u32 = 16;
+
+fn uuid_dtype(nullability: Nullability) -> VortexResult<DType> {
+    let storage = DType::FixedSizeList(
+        Arc::new(DType::Primitive(U8, Nullability::NonNullable)),
+        UUID_BYTE_LEN,
+        nullability,
+    );
+    Ok(DType::Extension(
+        ExtDType::<Uuid>::try_new(UuidMetadata::default(), storage)?.erased(),
+    ))
+}
 
 pub trait FromLogicalType {
     fn from_logical_type(
@@ -95,8 +112,12 @@ impl FromLogicalType for DType {
             DUCKDB_TYPE::DUCKDB_TYPE_USMALLINT => DType::Primitive(U16, nullability),
             DUCKDB_TYPE::DUCKDB_TYPE_UINTEGER => DType::Primitive(U32, nullability),
             DUCKDB_TYPE::DUCKDB_TYPE_UBIGINT => DType::Primitive(U64, nullability),
-            DUCKDB_TYPE::DUCKDB_TYPE_HUGEINT => vortex_bail!("I128 is not in Vortex type system"),
-            DUCKDB_TYPE::DUCKDB_TYPE_UHUGEINT => vortex_bail!("U128 is not in Vortex type system"),
+            DUCKDB_TYPE::DUCKDB_TYPE_HUGEINT => {
+                crate::convert::ext_types::hugeint_dtype(nullability)?
+            }
+            DUCKDB_TYPE::DUCKDB_TYPE_UHUGEINT => {
+                crate::convert::ext_types::uhugeint_dtype(nullability)?
+            }
             DUCKDB_TYPE::DUCKDB_TYPE_FLOAT => DType::Primitive(F32, nullability),
             DUCKDB_TYPE::DUCKDB_TYPE_DOUBLE => DType::Primitive(F64, nullability),
             DUCKDB_TYPE::DUCKDB_TYPE_VARCHAR => DType::Utf8(nullability),
@@ -169,6 +190,45 @@ impl FromLogicalType for DType {
                     .collect::<VortexResult<_>>()?,
                 nullability,
             ),
+            DUCKDB_TYPE::DUCKDB_TYPE_MAP => {
+                let key = DType::from_logical_type(
+                    &logical_type.map_key_type(),
+                    Nullability::NonNullable,
+                )?;
+                let value = DType::from_logical_type(
+                    &logical_type.map_value_type(),
+                    Nullability::Nullable,
+                )?;
+                // DuckDB does not advertise key sort order; assume unsorted.
+                DType::map(key, value, false, nullability)?
+            }
+            DUCKDB_TYPE::DUCKDB_TYPE_UNION => {
+                let count = logical_type.union_member_count();
+                let mut names = Vec::with_capacity(count);
+                let mut dtypes = Vec::with_capacity(count);
+                let mut type_ids = Vec::with_capacity(count);
+                for i in 0..count {
+                    names.push(logical_type.union_member_name(i).to_string());
+                    dtypes.push(DType::from_logical_type(
+                        &logical_type.union_member_type(i),
+                        Nullability::Nullable,
+                    )?);
+                    type_ids.push(
+                        u8::try_from(i).map_err(|_| {
+                            vortex_err!("DuckDB UNION member count exceeds u8::MAX")
+                        })?,
+                    );
+                }
+                let field_names: FieldNames = names
+                    .into_iter()
+                    .map(vortex::dtype::FieldName::from)
+                    .collect();
+                DType::Union(
+                    UnionVariants::try_new(field_names, dtypes, type_ids)?,
+                    nullability,
+                )
+            }
+            DUCKDB_TYPE::DUCKDB_TYPE_UUID => uuid_dtype(nullability)?,
             DUCKDB_TYPE::DUCKDB_TYPE_GEOMETRY => {
                 let crs = logical_type.geometry_crs().map(|crs| crs.to_string());
                 DType::Extension(
@@ -179,16 +239,43 @@ impl FromLogicalType for DType {
                     .erased(),
                 )
             }
-            DUCKDB_TYPE::DUCKDB_TYPE_VARIANT => DType::Variant(nullability),
-            other @ (DUCKDB_TYPE::DUCKDB_TYPE_TIME_TZ
-            | DUCKDB_TYPE::DUCKDB_TYPE_INTERVAL
-            | DUCKDB_TYPE::DUCKDB_TYPE_ENUM
-            | DUCKDB_TYPE::DUCKDB_TYPE_MAP
-            | DUCKDB_TYPE::DUCKDB_TYPE_UUID
-            | DUCKDB_TYPE::DUCKDB_TYPE_UNION
-            | DUCKDB_TYPE::DUCKDB_TYPE_BIT
-            | DUCKDB_TYPE::DUCKDB_TYPE_ANY
-            | DUCKDB_TYPE::DUCKDB_TYPE_BIGNUM
+            DUCKDB_TYPE::DUCKDB_TYPE_VARIANT => {
+                let storage = DType::Struct(
+                    (0..logical_type.struct_type_child_count())
+                        .map(|i| {
+                            Ok((
+                                logical_type.struct_child_name(i),
+                                DType::from_logical_type(
+                                    &logical_type.struct_child_type(i),
+                                    Nullability::Nullable,
+                                )?,
+                            ))
+                        })
+                        .collect::<VortexResult<_>>()?,
+                    nullability,
+                );
+                DType::Extension(
+                    ExtDType::<crate::convert::ext_types::DuckVariant>::try_new(
+                        crate::convert::ext_types::EmptyExtMetadata,
+                        storage,
+                    )?
+                    .erased(),
+                )
+            }
+            DUCKDB_TYPE::DUCKDB_TYPE_INTERVAL => {
+                crate::convert::ext_types::interval_dtype(nullability)?
+            }
+            DUCKDB_TYPE::DUCKDB_TYPE_ENUM => {
+                crate::convert::ext_types::enum_dtype(logical_type, nullability)?
+            }
+            DUCKDB_TYPE::DUCKDB_TYPE_BIT => crate::convert::ext_types::bit_dtype(nullability)?,
+            DUCKDB_TYPE::DUCKDB_TYPE_BIGNUM => {
+                crate::convert::ext_types::bignum_dtype(nullability)?
+            }
+            DUCKDB_TYPE::DUCKDB_TYPE_TIME_TZ => {
+                crate::convert::ext_types::time_tz_dtype(nullability)?
+            }
+            other @ (DUCKDB_TYPE::DUCKDB_TYPE_ANY
             | DUCKDB_TYPE::DUCKDB_TYPE_STRING_LITERAL
             | DUCKDB_TYPE::DUCKDB_TYPE_INTEGER_LITERAL) => {
                 vortex_bail!("{other:?} -> DType conversion is not supported")
@@ -244,14 +331,41 @@ impl TryFrom<&DType> for LogicalType {
             DType::Struct(struct_type, _) => {
                 return LogicalType::try_from(struct_type);
             }
-            DType::Map(..) => vortex_bail!("Vortex Map isn't supported"),
-            // TODO(connor): Union
-            DType::Union(..) => vortex_bail!("Vortex Union isn't supported"),
+            DType::Map(map_dtype, _) => {
+                let key = LogicalType::try_from(&map_dtype.key_dtype())?;
+                let value = LogicalType::try_from(&map_dtype.value_dtype())?;
+                return LogicalType::map_type(key, value);
+            }
+            DType::Union(variants, _) => {
+                let member_types: Vec<LogicalType> = variants
+                    .variants()
+                    .map(|d| LogicalType::try_from(&d))
+                    .collect::<Result<_, _>>()?;
+                let member_names: Vec<CString> = variants
+                    .names()
+                    .iter()
+                    .map(|n| {
+                        CString::new(n.as_ref())
+                            .map_err(|_| vortex_err!("invalid union member name"))
+                    })
+                    .collect::<Result<_, _>>()?;
+                return LogicalType::union_type(member_types, member_names);
+            }
             DType::Variant(_) => vortex_bail!("Vortex Variant array aren't supported"),
             DType::Extension(ext_dtype) => {
                 // Handle first-party extension types that have DuckDB equivalents.
                 if let Some(temporal) = ext_dtype.metadata_opt::<AnyTemporal>() {
                     return temporal_to_duckdb(temporal);
+                }
+
+                if ext_dtype.is::<Uuid>() {
+                    return Ok(LogicalType::new(DUCKDB_TYPE::DUCKDB_TYPE_UUID));
+                }
+
+                if let Some(duckdb_ext) =
+                    crate::convert::ext_types::logical_type_from_duckdb_ext(ext_dtype)?
+                {
+                    return Ok(duckdb_ext);
                 }
 
                 // Native geometry types and WKB all surface to DuckDB as GEOMETRY so `ST_*` bind.
@@ -366,6 +480,7 @@ impl TryFrom<PType> for LogicalType {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CString;
     use std::sync::Arc;
 
     use rstest::rstest;
@@ -383,12 +498,15 @@ mod tests {
     use vortex::extension::datetime::Date;
     use vortex::extension::datetime::Time;
     use vortex::extension::datetime::Timestamp;
+    use vortex::extension::uuid::Uuid;
     use vortex::scalar::ScalarValue;
     use vortex_spatial::extension::SpatialMetadata;
     use vortex_spatial::extension::WellKnownBinary;
 
     use crate::convert::dtype::FromLogicalType;
     use crate::cpp;
+    use crate::cpp::duckdb_create_map_type;
+    use crate::cpp::duckdb_create_union_type;
     use crate::duckdb::LogicalType;
 
     #[test]
@@ -518,6 +636,78 @@ mod tests {
             logical_type.as_type_id(),
             cpp::DUCKDB_TYPE::DUCKDB_TYPE_LIST
         );
+    }
+
+    #[test]
+    fn test_uuid_type_roundtrip() -> VortexResult<()> {
+        let duckdb = LogicalType::new(cpp::DUCKDB_TYPE::DUCKDB_TYPE_UUID);
+        let vortex = DType::from_logical_type(&duckdb, Nullability::Nullable)?;
+
+        assert!(
+            vortex
+                .as_extension_opt()
+                .is_some_and(|ext| ext.is::<Uuid>())
+        );
+        assert_eq!(
+            LogicalType::try_from(&vortex)?.as_type_id(),
+            cpp::DUCKDB_TYPE::DUCKDB_TYPE_UUID
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_map_type_roundtrip() -> VortexResult<()> {
+        let key = LogicalType::varchar();
+        let value = LogicalType::int32();
+        let duckdb =
+            unsafe { LogicalType::own(duckdb_create_map_type(key.as_ptr(), value.as_ptr())) };
+        let vortex = DType::from_logical_type(&duckdb, Nullability::Nullable)?;
+        let map = vortex.as_map_opt().unwrap();
+
+        assert_eq!(map.key_dtype(), DType::Utf8(Nullability::NonNullable));
+        assert_eq!(
+            map.value_dtype(),
+            DType::Primitive(PType::I32, Nullability::Nullable)
+        );
+        let roundtrip = LogicalType::try_from(&vortex)?;
+        assert_eq!(roundtrip.as_type_id(), cpp::DUCKDB_TYPE::DUCKDB_TYPE_MAP);
+        assert_eq!(
+            roundtrip.map_key_type().as_type_id(),
+            cpp::DUCKDB_TYPE::DUCKDB_TYPE_VARCHAR
+        );
+        assert_eq!(
+            roundtrip.map_value_type().as_type_id(),
+            cpp::DUCKDB_TYPE::DUCKDB_TYPE_INTEGER
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_union_type_roundtrip() -> VortexResult<()> {
+        let string = LogicalType::varchar();
+        let integer = LogicalType::int32();
+        let mut member_types = vec![string.as_ptr(), integer.as_ptr()];
+        let string_name = CString::new("string").unwrap();
+        let integer_name = CString::new("integer").unwrap();
+        let mut member_names = vec![string_name.as_ptr(), integer_name.as_ptr()];
+        let duckdb = unsafe {
+            LogicalType::own(duckdb_create_union_type(
+                member_types.as_mut_ptr(),
+                member_names.as_mut_ptr(),
+                member_types.len() as _,
+            ))
+        };
+        let vortex = DType::from_logical_type(&duckdb, Nullability::Nullable)?;
+        let variants = vortex.as_union_variants_opt().unwrap();
+
+        assert_eq!(variants.names().as_ref(), ["string", "integer"]);
+        assert_eq!(variants.type_ids(), &[0, 1]);
+        let roundtrip = LogicalType::try_from(&vortex)?;
+        assert_eq!(roundtrip.as_type_id(), cpp::DUCKDB_TYPE::DUCKDB_TYPE_UNION);
+        assert_eq!(roundtrip.union_member_count(), 2);
+        assert_eq!(roundtrip.union_member_name(0).as_ref(), "string");
+        assert_eq!(roundtrip.union_member_name(1).as_ref(), "integer");
+        Ok(())
     }
 
     #[test]

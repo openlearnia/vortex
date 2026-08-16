@@ -5,6 +5,7 @@ use vortex::array::Canonical;
 use vortex::array::ExecutionCtx;
 use vortex::array::IntoArray;
 use vortex::array::arrays::ConstantArray;
+use vortex::dtype::DType;
 use vortex::error::VortexResult;
 use vortex::mask::Mask;
 
@@ -53,7 +54,22 @@ pub(crate) fn new_exporter_with_flatten(
     ctx: &mut ExecutionCtx,
     flatten: bool,
 ) -> VortexResult<Box<dyn ColumnExporter>> {
-    if flatten {
+    let custom_extension = matches!(
+        array.scalar().dtype(),
+        DType::Extension(ext)
+            if matches!(
+                ext.id().as_ref(),
+                crate::convert::ext_types::INTERVAL_EXT_ID
+                    | crate::convert::ext_types::ENUM_EXT_ID
+                    | crate::convert::ext_types::BIT_EXT_ID
+                    | crate::convert::ext_types::BIGNUM_EXT_ID
+                    | crate::convert::ext_types::HUGEINT_EXT_ID
+                    | crate::convert::ext_types::UHUGEINT_EXT_ID
+                    | crate::convert::ext_types::VARIANT_EXT_ID
+                    | crate::convert::ext_types::TIME_TZ_EXT_ID
+            )
+    );
+    if flatten || custom_extension || array.scalar().dtype().is_nested() {
         return canonical::new_exporter(array.into_array(), cache, ctx);
     }
     new_exporter(array)

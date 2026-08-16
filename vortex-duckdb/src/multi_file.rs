@@ -9,6 +9,7 @@ use url::Url;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::error::vortex_err;
+use vortex::file::SegmentEncryptionKey;
 use vortex::file::multi::MultiFileDataSource;
 use vortex::file::multi::parse_uri_or_path;
 use vortex::io::compat::Compat;
@@ -88,11 +89,27 @@ pub fn bind_multi_file_scan(input: &BindInputRef) -> VortexResult<MultiLayoutDat
         .map(resolve_filesystem)
         .collect::<VortexResult<Vec<_>>>()?;
 
+    // Optional second positional bind param: raw AES-GCM key (DuckLake MultiFile OpenFileInfo).
+    let encryption_key = match input.get_parameter(1) {
+        None => None,
+        Some(value) => match value.extract() {
+            ExtractedValue::Blob(bytes) if !bytes.is_empty() => {
+                Some(SegmentEncryptionKey::try_new(bytes.as_slice().to_vec())?)
+            }
+            ExtractedValue::Null => None,
+            other => vortex_bail!("encryption_key bind parameter must be BLOB, got {other:?}"),
+        },
+    };
+
     RUNTIME.block_on(async {
         let mut builder = MultiFileDataSource::new(SESSION.clone());
 
         for (fs, glob) in resolved {
             builder = builder.with_glob(&glob, Some(fs));
+        }
+
+        if let Some(key) = encryption_key {
+            builder = builder.with_open_options(move |opts| opts.with_encryption_key(key.clone()));
         }
 
         builder.build().await

@@ -11,6 +11,7 @@ use std::sync::LazyLock;
 use std::sync::OnceLock;
 
 use vortex::VortexSessionDefault;
+use vortex::array::dtype::session::DTypeSessionExt;
 use vortex::cloud::Registry;
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
@@ -27,6 +28,7 @@ mod convert;
 pub mod duckdb;
 mod exporter;
 mod ffi;
+mod full_metadata;
 mod multi_file;
 mod projection;
 mod table_function;
@@ -39,6 +41,8 @@ mod table_function;
 /// cbindgen:ignore
 mod cpp;
 mod copy;
+/// cbindgen:ignore
+mod duckdb_c_api_extra;
 #[cfg(test)]
 mod e2e_test;
 
@@ -49,6 +53,14 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
 static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let session = VortexSession::default().with_handle(RUNTIME.handle());
     vortex_spatial::initialize(&session);
+    session.dtypes().register(convert::ext_types::DuckInterval);
+    session.dtypes().register(convert::ext_types::DuckEnum);
+    session.dtypes().register(convert::ext_types::DuckBit);
+    session.dtypes().register(convert::ext_types::DuckBignum);
+    session.dtypes().register(convert::ext_types::DuckHugeInt);
+    session.dtypes().register(convert::ext_types::DuckUHugeInt);
+    session.dtypes().register(convert::ext_types::DuckVariant);
+    session.dtypes().register(convert::ext_types::DuckTimeTz);
     session
 });
 

@@ -9,11 +9,14 @@ use vortex::array::arrays::DecimalArray;
 use vortex::array::arrays::ExtensionArray;
 use vortex::array::arrays::FixedSizeListArray;
 use vortex::array::arrays::ListViewArray;
+use vortex::array::arrays::MapArray;
 use vortex::array::arrays::PrimitiveArray;
 use vortex::array::arrays::StructArray;
 use vortex::array::arrays::TemporalArray;
+use vortex::array::arrays::UnionArray;
 use vortex::array::builders::ArrayBuilder;
 use vortex::array::builders::VarBinViewBuilder;
+use vortex::array::builtins::ArrayBuiltins;
 use vortex::array::dtype::extension::ExtDType;
 use vortex::array::validity::Validity;
 use vortex::buffer::BitBuffer;
@@ -23,18 +26,25 @@ use vortex::dtype::DType;
 use vortex::dtype::DecimalDType;
 use vortex::dtype::DecimalType;
 use vortex::dtype::FieldNames;
+use vortex::dtype::MapDType;
 use vortex::dtype::NativePType;
 use vortex::dtype::Nullability;
+use vortex::dtype::PType;
+use vortex::dtype::UnionVariants;
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::extension::datetime::TimeUnit;
+use vortex::extension::uuid::Uuid;
+use vortex::extension::uuid::UuidMetadata;
 use vortex::mask::Mask;
 use vortex_spatial::extension::SpatialMetadata;
 use vortex_spatial::extension::WellKnownBinary;
 
+use crate::convert::dtype::FromLogicalType;
 use crate::cpp::DUCKDB_TYPE;
 use crate::cpp::duckdb_date;
+use crate::cpp::duckdb_hugeint;
 use crate::cpp::duckdb_list_entry;
 use crate::cpp::duckdb_string_t;
 use crate::cpp::duckdb_string_t_data;
@@ -208,6 +218,188 @@ fn process_duckdb_lists(
     }
 }
 
+fn uuid_vector_to_vortex(vector: &VectorRef, len: usize) -> VortexResult<ArrayRef> {
+    let values = vector.as_slice_with_len::<duckdb_hugeint>(len);
+    let mut bytes = BufferMut::<u8>::with_capacity(len * 16);
+    for value in values {
+        let upper = (value.upper as u64) ^ (1_u64 << 63);
+        bytes.extend_from_slice(&upper.to_be_bytes());
+        bytes.extend_from_slice(&value.lower.to_be_bytes());
+    }
+    let storage = FixedSizeListArray::try_new(
+        PrimitiveArray::new(bytes.freeze(), Validity::NonNullable).into_array(),
+        16,
+        vector.validity_ref(len).to_validity(),
+        len,
+    )?
+    .into_array();
+    let dtype =
+        ExtDType::<Uuid>::try_new(UuidMetadata::default(), storage.dtype().clone())?.erased();
+    Ok(ExtensionArray::try_new(dtype, storage)?.into_array())
+}
+
+fn hugeint_vector_to_vortex(vector: &VectorRef, len: usize) -> VortexResult<ArrayRef> {
+    let values = vector.as_slice_with_len::<duckdb_hugeint>(len);
+    let mut bytes = BufferMut::<u8>::with_capacity(len * 16);
+    for value in values {
+        bytes.extend_from_slice(&value.lower.to_le_bytes());
+        bytes.extend_from_slice(&value.upper.to_le_bytes());
+    }
+    let storage = FixedSizeListArray::try_new(
+        PrimitiveArray::new(bytes.freeze(), Validity::NonNullable).into_array(),
+        16,
+        vector.validity_ref(len).to_validity(),
+        len,
+    )?
+    .into_array();
+    let dtype = match vector.logical_type().as_type_id() {
+        DUCKDB_TYPE::DUCKDB_TYPE_HUGEINT => {
+            ExtDType::<crate::convert::ext_types::DuckHugeInt>::try_new(
+                crate::convert::ext_types::EmptyExtMetadata,
+                storage.dtype().clone(),
+            )?
+            .erased()
+        }
+        DUCKDB_TYPE::DUCKDB_TYPE_UHUGEINT => {
+            ExtDType::<crate::convert::ext_types::DuckUHugeInt>::try_new(
+                crate::convert::ext_types::EmptyExtMetadata,
+                storage.dtype().clone(),
+            )?
+            .erased()
+        }
+        other => vortex_bail!("unexpected hugeint logical type {other:?}"),
+    };
+    Ok(ExtensionArray::try_new(dtype, storage)?.into_array())
+}
+
+fn interval_vector_to_vortex(vector: &VectorRef, len: usize) -> VortexResult<ArrayRef> {
+    use crate::convert::ext_types::DuckInterval;
+    use crate::convert::ext_types::DuckdbIntervalPhysical;
+    use crate::convert::ext_types::EmptyExtMetadata;
+
+    let values = vector.as_slice_with_len::<DuckdbIntervalPhysical>(len);
+    let mut months = BufferMut::<i32>::with_capacity(len);
+    let mut days = BufferMut::<i32>::with_capacity(len);
+    let mut micros = BufferMut::<i64>::with_capacity(len);
+    for v in values {
+        months.push(v.months);
+        days.push(v.days);
+        micros.push(v.micros);
+    }
+    let storage = StructArray::try_new(
+        FieldNames::from(["months", "days", "micros"]),
+        vec![
+            PrimitiveArray::new(months.freeze(), Validity::NonNullable).into_array(),
+            PrimitiveArray::new(days.freeze(), Validity::NonNullable).into_array(),
+            PrimitiveArray::new(micros.freeze(), Validity::NonNullable).into_array(),
+        ],
+        len,
+        vector.validity_ref(len).to_validity(),
+    )?
+    .into_array();
+    let dtype =
+        ExtDType::<DuckInterval>::try_new(EmptyExtMetadata, storage.dtype().clone())?.erased();
+    Ok(ExtensionArray::try_new(dtype, storage)?.into_array())
+}
+
+fn enum_vector_to_vortex(vector: &VectorRef, len: usize) -> VortexResult<ArrayRef> {
+    use crate::convert::ext_types::enum_dtype;
+    let dtype = enum_dtype(&vector.logical_type(), Nullability::Nullable)?;
+    let DType::Extension(ext) = &dtype else {
+        vortex_bail!("enum_dtype must return Extension");
+    };
+    let storage = match ext.storage_dtype() {
+        DType::Primitive(PType::U8, _) => vector_as_slice::<u8>(vector, len),
+        DType::Primitive(PType::U16, _) => vector_as_slice::<u16>(vector, len),
+        DType::Primitive(PType::U32, _) => vector_as_slice::<u32>(vector, len),
+        other => vortex_bail!("unexpected ENUM storage {other}"),
+    };
+    Ok(ExtensionArray::try_new(ext.clone(), storage)?.into_array())
+}
+
+fn bit_or_bignum_vector_to_vortex(
+    vector: &VectorRef,
+    len: usize,
+    dtype: DType,
+) -> VortexResult<ArrayRef> {
+    let DType::Extension(ext) = &dtype else {
+        vortex_bail!("expected Extension dtype");
+    };
+    let storage = vector_as_string_blob(vector, len, DType::Binary(Nullability::Nullable));
+    Ok(ExtensionArray::try_new(ext.clone(), storage)?.into_array())
+}
+
+fn map_vector_to_vortex(vector: &VectorRef, len: usize) -> VortexResult<ArrayRef> {
+    let logical_type = vector.logical_type();
+    let map_dtype = MapDType::try_new(
+        DType::from_logical_type(&logical_type.map_key_type(), Nullability::NonNullable)?,
+        DType::from_logical_type(&logical_type.map_value_type(), Nullability::Nullable)?,
+        false,
+    )?;
+    let validity = vector.validity_ref(len).execute_mask();
+    let entries = vector.as_slice_with_len::<duckdb_list_entry>(len);
+    let (offsets, sizes, child_len) = process_duckdb_lists(entries, &validity)?;
+    let child = vector.list_vector_get_child();
+    let key = flat_vector_to_vortex(child.struct_vector_get_child(0), child_len)?;
+    let key = key.cast(key.dtype().as_nonnullable())?;
+    let value = flat_vector_to_vortex(child.struct_vector_get_child(1), child_len)?;
+    let entry_struct = StructArray::try_new(
+        ["key", "value"].into(),
+        vec![key, value],
+        child_len,
+        Validity::NonNullable,
+    )?
+    .into_array();
+    let entries = ListViewArray::try_new(
+        entry_struct,
+        offsets.into_array(),
+        sizes.into_array(),
+        Validity::from_mask(validity, Nullability::Nullable),
+    )?;
+    Ok(MapArray::try_new(map_dtype, entries)?.into_array())
+}
+
+fn union_vector_to_vortex(vector: &VectorRef, len: usize) -> VortexResult<ArrayRef> {
+    let logical_type = vector.logical_type();
+    let variants = UnionVariants::new(
+        (0..logical_type.union_member_count())
+            .map(|idx| logical_type.union_member_name(idx).to_string())
+            .collect(),
+        (0..logical_type.union_member_count())
+            .map(|idx| {
+                DType::from_logical_type(
+                    &logical_type.union_member_type(idx),
+                    Nullability::Nullable,
+                )
+            })
+            .collect::<VortexResult<_>>()?,
+    )?;
+    let type_ids = flat_vector_to_vortex(vector.struct_vector_get_child(0), len)?;
+    let children = (0..variants.len())
+        .map(|idx| flat_vector_to_vortex(vector.struct_vector_get_child(idx + 1), len))
+        .collect::<VortexResult<Vec<_>>>()?;
+    Ok(UnionArray::try_new(type_ids, variants, children)?.into_array())
+}
+
+fn variant_vector_to_vortex(vector: &VectorRef, len: usize) -> VortexResult<ArrayRef> {
+    use crate::convert::ext_types::DuckVariant;
+    use crate::convert::ext_types::EmptyExtMetadata;
+
+    let logical_type = vector.logical_type();
+    let children = (0..logical_type.struct_type_child_count())
+        .map(|idx| flat_vector_to_vortex(vector.struct_vector_get_child(idx), len))
+        .collect::<VortexResult<Vec<_>>>()?;
+    let names = (0..logical_type.struct_type_child_count())
+        .map(|idx| logical_type.struct_child_name(idx))
+        .collect();
+    let storage =
+        StructArray::try_new(names, children, len, vector.validity_ref(len).to_validity())?
+            .into_array();
+    let dtype =
+        ExtDType::<DuckVariant>::try_new(EmptyExtMetadata, storage.dtype().clone())?.erased();
+    Ok(ExtensionArray::try_new(dtype, storage)?.into_array())
+}
+
 /// Converts flat vector to a vortex array
 pub fn flat_vector_to_vortex(vector: &VectorRef, len: usize) -> VortexResult<ArrayRef> {
     let logical_type = vector.logical_type();
@@ -247,6 +439,14 @@ pub fn flat_vector_to_vortex(vector: &VectorRef, len: usize) -> VortexResult<Arr
             let arr = vector_mapped(vector, len, |duckdb_time_ns { nanos }| *nanos);
             Ok(TemporalArray::new_time(arr, TimeUnit::Nanoseconds).into_array())
         }
+        DUCKDB_TYPE::DUCKDB_TYPE_TIME_TZ => {
+            let dtype = crate::convert::ext_types::time_tz_dtype(Nullability::Nullable)?;
+            let DType::Extension(ext) = dtype else {
+                vortex_bail!("time_tz_dtype must return Extension");
+            };
+            let storage = vector_as_slice::<u64>(vector, len);
+            Ok(ExtensionArray::try_new(ext, storage)?.into_array())
+        }
         DUCKDB_TYPE::DUCKDB_TYPE_VARCHAR => Ok(vector_as_string_blob(
             vector,
             len,
@@ -269,6 +469,7 @@ pub fn flat_vector_to_vortex(vector: &VectorRef, len: usize) -> VortexResult<Arr
 
             Ok(ExtensionArray::try_new(wkb_type, wkb_values.into_array())?.into_array())
         }
+        DUCKDB_TYPE::DUCKDB_TYPE_UUID => uuid_vector_to_vortex(vector, len),
         DUCKDB_TYPE::DUCKDB_TYPE_BOOLEAN => {
             let data = vector.as_slice_with_len::<bool>(len);
 
@@ -347,6 +548,7 @@ pub fn flat_vector_to_vortex(vector: &VectorRef, len: usize) -> VortexResult<Arr
             )
             .map(|a| a.into_array())
         }
+        DUCKDB_TYPE::DUCKDB_TYPE_MAP => map_vector_to_vortex(vector, len),
         DUCKDB_TYPE::DUCKDB_TYPE_STRUCT => {
             let logical_type = vector.logical_type();
             let children = (0..logical_type.struct_type_child_count())
@@ -359,6 +561,23 @@ pub fn flat_vector_to_vortex(vector: &VectorRef, len: usize) -> VortexResult<Arr
             StructArray::try_new(names, children, len, vector.validity_ref(len).to_validity())
                 .map(|a| a.into_array())
         }
+        DUCKDB_TYPE::DUCKDB_TYPE_UNION => union_vector_to_vortex(vector, len),
+        DUCKDB_TYPE::DUCKDB_TYPE_VARIANT => variant_vector_to_vortex(vector, len),
+        DUCKDB_TYPE::DUCKDB_TYPE_HUGEINT | DUCKDB_TYPE::DUCKDB_TYPE_UHUGEINT => {
+            hugeint_vector_to_vortex(vector, len)
+        }
+        DUCKDB_TYPE::DUCKDB_TYPE_INTERVAL => interval_vector_to_vortex(vector, len),
+        DUCKDB_TYPE::DUCKDB_TYPE_ENUM => enum_vector_to_vortex(vector, len),
+        DUCKDB_TYPE::DUCKDB_TYPE_BIT => bit_or_bignum_vector_to_vortex(
+            vector,
+            len,
+            crate::convert::ext_types::bit_dtype(Nullability::Nullable)?,
+        ),
+        DUCKDB_TYPE::DUCKDB_TYPE_BIGNUM => bit_or_bignum_vector_to_vortex(
+            vector,
+            len,
+            crate::convert::ext_types::bignum_dtype(Nullability::Nullable)?,
+        ),
         type_id => vortex_bail!("{type_id:?} flat Vector to Vortex array not supported"),
     }
 }
@@ -393,12 +612,21 @@ mod tests {
     use vortex::array::VortexSessionExecute;
     use vortex::array::arrays::BoolArray;
     use vortex::array::arrays::Extension;
+    use vortex::array::arrays::MapArray;
+    use vortex::array::arrays::PrimitiveArray;
+    use vortex::array::arrays::UnionArray;
     use vortex::array::arrays::VarBinViewArray;
+    use vortex::array::arrays::extension::ExtensionArrayExt;
     use vortex::array::arrays::fixed_size_list::FixedSizeListArrayExt;
+    use vortex::array::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
     use vortex::array::arrays::listview::ListViewArrayExt;
     use vortex::array::arrays::listview::ListViewArraySlotsExt;
+    use vortex::array::arrays::map::MapArrayExt;
     use vortex::array::arrays::struct_::StructArrayExt;
+    use vortex::array::arrays::union::UnionArrayExt;
+    use vortex::array::arrays::union::UnionArraySlotsExt;
     use vortex::array::assert_arrays_eq;
+    use vortex::dtype::PType;
     use vortex::error::VortexExpect;
     use vortex::mask::Mask;
     use vortex_array::array_session;
@@ -745,6 +973,118 @@ mod tests {
             PrimitiveArray::from_option_iter([Some(1i32), Some(2), Some(3), Some(4)]),
             &mut ctx
         );
+    }
+
+    #[test]
+    fn test_uuid_vector_conversion() {
+        let bytes = *b"0123456789abcdef";
+        let mut vector = Vector::with_capacity(&LogicalType::new(DUCKDB_TYPE::DUCKDB_TYPE_UUID), 1);
+        unsafe {
+            vector.as_slice_mut::<duckdb_hugeint>(1)[0] = duckdb_hugeint {
+                upper: (u64::from_be_bytes(bytes[..8].try_into().unwrap()) ^ (1_u64 << 63)) as i64,
+                lower: u64::from_be_bytes(bytes[8..].try_into().unwrap()),
+            };
+        }
+
+        let result = flat_vector_to_vortex(&vector, 1).unwrap();
+        let extension = result.as_opt::<Extension>().unwrap().into_owned();
+        let storage = extension
+            .storage_array()
+            .clone()
+            .execute::<FixedSizeListArray>(&mut array_session().create_execution_ctx())
+            .unwrap();
+        let values = storage
+            .elements()
+            .clone()
+            .execute::<PrimitiveArray>(&mut array_session().create_execution_ctx())
+            .unwrap();
+
+        assert_eq!(values.as_slice::<u8>(), &bytes);
+    }
+
+    #[test]
+    fn test_map_vector_conversion() {
+        let logical_type =
+            LogicalType::map_type(LogicalType::int32(), LogicalType::varchar()).unwrap();
+        let mut vector = Vector::with_capacity(&logical_type, 1);
+        unsafe {
+            vector.as_slice_mut::<duckdb_list_entry>(1)[0] = duckdb_list_entry {
+                offset: 0,
+                length: 2,
+            };
+            let entries = vector.list_vector_get_child_mut();
+            entries
+                .struct_vector_get_child_mut(0)
+                .as_slice_mut::<i32>(2)
+                .copy_from_slice(&[1, 2]);
+            for (idx, value) in ["one", "two"].iter().enumerate() {
+                cpp::duckdb_vector_assign_string_element(
+                    entries.struct_vector_get_child_mut(1).as_ptr(),
+                    idx as _,
+                    CString::new(*value).unwrap().as_ptr(),
+                );
+            }
+        }
+
+        let result = flat_vector_to_vortex(&vector, 1).unwrap();
+        let map = result
+            .execute::<MapArray>(&mut array_session().create_execution_ctx())
+            .unwrap();
+
+        assert_eq!(map.entry_count_at(0), 2);
+        assert_eq!(
+            map.map_dtype().key_dtype(),
+            DType::Primitive(PType::I32, Nullability::NonNullable)
+        );
+    }
+
+    #[test]
+    fn test_union_vector_conversion() {
+        let logical_type = LogicalType::union_type(
+            [LogicalType::int32(), LogicalType::varchar()],
+            [
+                CString::new("integer").unwrap(),
+                CString::new("string").unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut vector = Vector::with_capacity(&logical_type, 2);
+        unsafe {
+            vector
+                .struct_vector_get_child_mut(0)
+                .as_slice_mut::<u8>(2)
+                .copy_from_slice(&[0, 1]);
+            vector
+                .struct_vector_get_child_mut(1)
+                .as_slice_mut::<i32>(2)
+                .copy_from_slice(&[42, 0]);
+            let int_validity = vector
+                .struct_vector_get_child_mut(1)
+                .ensure_validity_bitslice(2);
+            int_validity.set(1, false);
+            cpp::duckdb_vector_assign_string_element(
+                vector.struct_vector_get_child_mut(2).as_ptr(),
+                1,
+                CString::new("answer").unwrap().as_ptr(),
+            );
+            let string_validity = vector
+                .struct_vector_get_child_mut(2)
+                .ensure_validity_bitslice(2);
+            string_validity.set(0, false);
+        }
+
+        let result = flat_vector_to_vortex(&vector, 2).unwrap();
+        let union = result
+            .execute::<UnionArray>(&mut array_session().create_execution_ctx())
+            .unwrap();
+        let tags = union
+            .type_ids()
+            .clone()
+            .execute::<PrimitiveArray>(&mut array_session().create_execution_ctx())
+            .unwrap();
+
+        assert_eq!(tags.as_slice::<u8>(), &[0, 1]);
+        assert_eq!(union.variants().names().as_ref(), ["integer", "string"]);
     }
 
     #[test]

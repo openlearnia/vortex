@@ -4,6 +4,7 @@
 #include "data.hpp"
 #include "error.hpp"
 #include "table_function.hpp"
+#include "multi_file_function.hpp"
 #include "expr.h"
 #include "vortex_duckdb.h"
 #include "table_function.h"
@@ -108,20 +109,23 @@ unique_ptr<BaseStatistics> base_stats(duckdb_column_statistics &stats, LogicalTy
     return out.ToUnique();
 }
 
-unique_ptr<BaseStatistics> statistics(ClientContext &, const FunctionData *bind_data, column_t column_index) {
+unique_ptr<BaseStatistics> vortex_table_statistics(ClientContext &, const FunctionData *bind_data,
+                                                   column_t column_index) {
     if (IsVirtualColumn(column_index)) {
         return {};
     }
 
     const auto &bind = bind_data->Cast<VortexBindData>();
     const void *const ffi_bind = get_ffi_bind(bind_data);
+    const LogicalType type = bind.types[column_index];
+    if (type.IsNested() || type.id() == LogicalTypeId::VARIANT) {
+        return {};
+    }
 
     duckdb_column_statistics statistics = {};
     if (!duckdb_table_function_statistics(ffi_bind, column_index, &statistics)) {
         return {};
     }
-
-    const LogicalType type = bind.types[column_index];
 
     switch (type.id()) {
     case LogicalTypeId::BOOLEAN:
@@ -142,13 +146,6 @@ unique_ptr<BaseStatistics> statistics(ClientContext &, const FunctionData *bind_
     case LogicalTypeId::VARCHAR:
     case LogicalTypeId::BLOB: {
         return string_stats(statistics, type);
-    }
-    case LogicalTypeId::STRUCT: {
-        // TODO(myrrc)
-        // Duckdb's has_null has a different semantics for structs.
-        // If we propagate our has_null, this breaks Duckdb optimizer.
-        // You can reproduce it in struct.slt test in vortex-sqllogictests:
-        return {};
     }
     default:
         return base_stats(statistics, type);
@@ -215,7 +212,7 @@ unique_ptr<FunctionData> duckdb_vx_table_function_bind(ClientContext &,
     return make_uniq<VortexBindData>(std::move(cdata), return_types);
 }
 
-unique_ptr<GlobalTableFunctionState> init_global(ClientContext &context, TableFunctionInitInput &input) {
+unique_ptr<GlobalTableFunctionState> vortex_table_init_global(ClientContext &context, TableFunctionInitInput &input) {
     const void *const ffi_bind = get_ffi_bind(input.bind_data.get());
 
     duckdb_vx_tfunc_init_input ffi_input = {
@@ -238,8 +235,8 @@ unique_ptr<GlobalTableFunctionState> init_global(ClientContext &context, TableFu
     return make_uniq<VortexGlobalData>(std::move(cdata));
 }
 
-unique_ptr<LocalTableFunctionState>
-init_local(ExecutionContext &, TableFunctionInitInput &input, GlobalTableFunctionState *global_state) {
+unique_ptr<LocalTableFunctionState> vortex_table_init_local(TableFunctionInitInput &input,
+                                                            GlobalTableFunctionState *global_state) {
     const void *const ffi_bind = get_ffi_bind(input.bind_data.get());
     void *const ffi_global = get_ffi_global(global_state);
 
@@ -248,7 +245,12 @@ init_local(ExecutionContext &, TableFunctionInitInput &input, GlobalTableFunctio
     return make_uniq<VortexLocalData>(std::move(cdata));
 }
 
-void function(ClientContext &, TableFunctionInput &input, DataChunk &output) {
+static unique_ptr<LocalTableFunctionState> init_local(ExecutionContext &, TableFunctionInitInput &input,
+                                                      GlobalTableFunctionState *global_state) {
+    return vortex_table_init_local(input, global_state);
+}
+
+void vortex_table_scan(ClientContext &, TableFunctionInput &input, DataChunk &output) {
     void *const ffi_global = get_ffi_global(input.global_state.get());
     void *const ffi_local = get_ffi_local(input.local_state.get());
 
@@ -296,6 +298,9 @@ extern "C" duckdb_value duckdb_vx_tfunc_bind_input_get_parameter(duckdb_vx_tfunc
                                                                  size_t index) {
     D_ASSERT(ffi_input);
     const TableFunctionBindInput &input = *reinterpret_cast<TableFunctionBindInput *>(ffi_input);
+    if (index >= input.inputs.size()) {
+        return nullptr;
+    }
     return reinterpret_cast<duckdb_value>(new Value(input.inputs[index]));
 }
 
@@ -367,7 +372,7 @@ InsertionOrderPreservingMap<string> to_string(TableFunctionToStringInput &input)
 }
 
 duckdb_state register_table_function(DatabaseInstance &db, LogicalType parameter, const std::string &name) {
-    TableFunction tf(name, {}, function, duckdb_vx_table_function_bind, init_global, init_local);
+    TableFunction tf(name, {}, vortex_table_scan, duckdb_vx_table_function_bind, vortex_table_init_global, init_local);
 
     tf.projection_pushdown = true;
     tf.filter_pushdown = true;
@@ -385,7 +390,7 @@ duckdb_state register_table_function(DatabaseInstance &db, LogicalType parameter
     tf.get_partition_data = get_partition_data;
     tf.to_string = to_string;
     tf.table_scan_progress = table_scan_progress;
-    tf.statistics = statistics;
+    tf.statistics = vortex_table_statistics;
 
     tf.late_materialization = true;
     // Columns that uniquely identify a row for deferred re-fetch in a multi
@@ -434,5 +439,8 @@ extern "C" duckdb_state duckdb_vx_register_table_functions(duckdb_database ffi_d
             }
         }
     }
-    return DuckDBSuccess;
+    if (register_vortex_full_metadata(db) == DuckDBError) {
+        return DuckDBError;
+    }
+    return register_vortex_multi_file_scan(db);
 }

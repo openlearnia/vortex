@@ -13,6 +13,32 @@
 
 #define COUNT_STAR_PROJ_IDX UINT64_MAX
 
+typedef struct {
+  const char *name;
+  size_t name_len;
+  const char *duckdb_type;
+  size_t duckdb_type_len;
+  uint64_t num_children;
+} duckdb_vx_schema_node;
+
+typedef struct {
+  uint64_t column_id;
+  const char *stats_min;
+  size_t stats_min_len;
+  bool has_stats_min;
+  const char *stats_max;
+  size_t stats_max_len;
+  bool has_stats_max;
+  uint64_t stats_null_count;
+  bool has_null_count;
+  uint64_t stats_num_values;
+  bool has_num_values;
+  uint64_t total_compressed_size;
+  bool has_compressed_size;
+  bool contains_nan;
+  bool has_contains_nan;
+} duckdb_vx_column_stat;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -84,6 +110,10 @@ duckdb_vx_data duckdb_copy_function_copy_to_bind(const char *const *column_names
 extern
 duckdb_vx_data duckdb_copy_function_copy_to_initialize_global(const void *bind_data,
                                                               const char *file_path,
+                                                              const uint8_t *field_ids_bytes,
+                                                              size_t field_ids_len,
+                                                              const uint8_t *encryption_key_bytes,
+                                                              size_t encryption_key_len,
                                                               duckdb_vx_error *error_out);
 
 extern
@@ -92,7 +122,55 @@ void duckdb_copy_function_copy_to_sink(const void *bind_data,
                                        duckdb_data_chunk data_chunk,
                                        duckdb_vx_error *error_out);
 
-extern void duckdb_copy_function_copy_to_finalize(void *global_data, duckdb_vx_error *error_out);
+extern
+void duckdb_copy_function_copy_to_finalize(void *global_data,
+                                           uint64_t *row_count_out,
+                                           uint64_t *file_size_out,
+                                           duckdb_vx_error *error_out);
+
+extern uint64_t duckdb_copy_function_exported_stats_count(const void *global_data);
+
+extern
+bool duckdb_copy_function_exported_stat_at(const void *global_data,
+                                           uint64_t index,
+                                           char **name_out,
+                                           uint64_t *null_count_out,
+                                           bool *has_null_count_out,
+                                           uint64_t *num_values_out,
+                                           bool *has_num_values_out,
+                                           uint64_t *column_size_out,
+                                           bool *has_column_size_out,
+                                           char **min_out,
+                                           char **max_out,
+                                           bool *has_nan_out,
+                                           bool *has_has_nan_out);
+
+extern
+duckdb_vx_data duckdb_vortex_full_metadata_open(const char *file_path,
+                                                duckdb_vx_error *error_out);
+
+extern uint64_t duckdb_vortex_full_metadata_row_count(const void *meta);
+
+extern uint64_t duckdb_vortex_full_metadata_file_size(const void *meta);
+
+extern size_t duckdb_vortex_full_metadata_schema_count(const void *meta);
+
+extern
+bool duckdb_vortex_full_metadata_schema_at(const void *meta,
+                                           size_t index,
+                                           duckdb_vx_schema_node *out);
+
+extern size_t duckdb_vortex_full_metadata_stats_count(const void *meta);
+
+extern
+bool duckdb_vortex_full_metadata_stat_at(const void *meta,
+                                         size_t index,
+                                         duckdb_vx_column_stat *out);
+
+extern
+uint8_t *duckdb_vortex_read_ducklake_field_ids(const char *file_path,
+                                               size_t *len_out,
+                                               duckdb_vx_error *error_out);
 
 #ifdef __cplusplus
 }  // extern "C"

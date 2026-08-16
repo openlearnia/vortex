@@ -16,6 +16,7 @@ use crate::copy::copy_to_bind;
 use crate::copy::copy_to_finalize;
 use crate::copy::copy_to_initialize_global;
 use crate::copy::copy_to_sink;
+use crate::copy::read_ducklake_field_ids_metadata;
 use crate::cpp;
 use crate::duckdb::AggregatePushdownInput;
 use crate::duckdb::BindInput;
@@ -294,6 +295,10 @@ pub unsafe extern "C-unwind" fn duckdb_copy_function_copy_to_bind(
 pub unsafe extern "C-unwind" fn duckdb_copy_function_copy_to_initialize_global(
     bind_data: *const c_void,
     file_path: *const c_char,
+    field_ids_bytes: *const u8,
+    field_ids_len: usize,
+    encryption_key_bytes: *const u8,
+    encryption_key_len: usize,
     error_out: *mut cpp::duckdb_vx_error,
 ) -> cpp::duckdb_vx_data {
     let file_path = unsafe { CStr::from_ptr(file_path) }
@@ -301,8 +306,22 @@ pub unsafe extern "C-unwind" fn duckdb_copy_function_copy_to_initialize_global(
         .into_owned();
     let bind_data = unsafe { bind_data.cast::<CopyFunctionBind>().as_ref() }
         .vortex_expect("bind_data null pointer");
+    let field_ids_metadata = if field_ids_bytes.is_null() || field_ids_len == 0 {
+        None
+    } else {
+        Some(unsafe { std::slice::from_raw_parts(field_ids_bytes, field_ids_len) }.to_vec())
+    };
+    let encryption_key = if encryption_key_bytes.is_null() || encryption_key_len == 0 {
+        None
+    } else {
+        Some(
+            unsafe { std::slice::from_raw_parts(encryption_key_bytes, encryption_key_len) }
+                .to_vec(),
+        )
+    };
     try_or_null(error_out, || {
-        let bind_data = copy_to_initialize_global(bind_data, file_path)?;
+        let bind_data =
+            copy_to_initialize_global(bind_data, file_path, field_ids_metadata, encryption_key)?;
         Ok(Data::from(Box::new(bind_data)).as_ptr())
     })
 }
@@ -327,9 +346,293 @@ pub unsafe extern "C-unwind" fn duckdb_copy_function_copy_to_sink(
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn duckdb_copy_function_copy_to_finalize(
     global_data: *mut c_void,
+    row_count_out: *mut u64,
+    file_size_out: *mut u64,
     error_out: *mut cpp::duckdb_vx_error,
 ) {
     let global_data = unsafe { global_data.cast::<CopyFunctionGlobal>().as_mut() }
         .vortex_expect("bind_data null pointer");
-    try_or(error_out, || copy_to_finalize(global_data))
+    try_or(error_out, || {
+        let (row_count, file_size) = copy_to_finalize(global_data)?;
+        if !row_count_out.is_null() {
+            unsafe { *row_count_out = row_count };
+        }
+        if !file_size_out.is_null() {
+            unsafe { *file_size_out = file_size };
+        }
+        Ok(())
+    })
+}
+
+/// Returns the number of exported column statistics entries after finalize.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_copy_function_exported_stats_count(
+    global_data: *const c_void,
+) -> u64 {
+    let Some(global_data) = (unsafe { global_data.cast::<CopyFunctionGlobal>().as_ref() }) else {
+        return 0;
+    };
+    global_data.exported_stats.len() as u64
+}
+
+/// Copies one exported column statistic into C-compatible out params.
+/// String out-params are heap-allocated with `malloc` and must be freed by the caller.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_copy_function_exported_stat_at(
+    global_data: *const c_void,
+    index: u64,
+    name_out: *mut *mut c_char,
+    null_count_out: *mut u64,
+    has_null_count_out: *mut bool,
+    num_values_out: *mut u64,
+    has_num_values_out: *mut bool,
+    column_size_out: *mut u64,
+    has_column_size_out: *mut bool,
+    min_out: *mut *mut c_char,
+    max_out: *mut *mut c_char,
+    has_nan_out: *mut bool,
+    has_has_nan_out: *mut bool,
+) -> bool {
+    use std::ffi::CString;
+
+    let Some(global_data) = (unsafe { global_data.cast::<CopyFunctionGlobal>().as_ref() }) else {
+        return false;
+    };
+    let Some(stat) = global_data.exported_stats.get(index as usize) else {
+        return false;
+    };
+
+    unsafe fn set_cstr(out: *mut *mut c_char, value: &str) {
+        if out.is_null() {
+            return;
+        }
+        let c = CString::new(value).unwrap_or_default();
+        unsafe { *out = c.into_raw() };
+    }
+
+    unsafe {
+        set_cstr(name_out, &stat.name);
+        if let Some(v) = stat.null_count {
+            *null_count_out = v;
+            *has_null_count_out = true;
+        } else {
+            *has_null_count_out = false;
+        }
+        if let Some(v) = stat.num_values {
+            *num_values_out = v;
+            *has_num_values_out = true;
+        } else {
+            *has_num_values_out = false;
+        }
+        if let Some(v) = stat.column_size_bytes {
+            *column_size_out = v;
+            *has_column_size_out = true;
+        } else {
+            *has_column_size_out = false;
+        }
+        if let Some(ref min) = stat.min {
+            set_cstr(min_out, min);
+        } else if !min_out.is_null() {
+            *min_out = ptr::null_mut();
+        }
+        if let Some(ref max) = stat.max {
+            set_cstr(max_out, max);
+        } else if !max_out.is_null() {
+            *max_out = ptr::null_mut();
+        }
+        if let Some(v) = stat.has_nan {
+            *has_nan_out = v;
+            *has_has_nan_out = true;
+        } else {
+            *has_has_nan_out = false;
+        }
+    }
+    true
+}
+
+#[repr(C)]
+pub struct duckdb_vx_schema_node {
+    pub name: *const c_char,
+    pub name_len: usize,
+    pub duckdb_type: *const c_char,
+    pub duckdb_type_len: usize,
+    pub num_children: u64,
+}
+
+#[repr(C)]
+pub struct duckdb_vx_column_stat {
+    pub column_id: u64,
+    pub stats_min: *const c_char,
+    pub stats_min_len: usize,
+    pub has_stats_min: bool,
+    pub stats_max: *const c_char,
+    pub stats_max_len: usize,
+    pub has_stats_max: bool,
+    pub stats_null_count: u64,
+    pub has_null_count: bool,
+    pub stats_num_values: u64,
+    pub has_num_values: bool,
+    pub total_compressed_size: u64,
+    pub has_compressed_size: bool,
+    pub contains_nan: bool,
+    pub has_contains_nan: bool,
+}
+
+/// Opens Vortex footer metadata for one file. Caller owns the returned `duckdb_vx_data`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_vortex_full_metadata_open(
+    file_path: *const c_char,
+    error_out: *mut cpp::duckdb_vx_error,
+) -> cpp::duckdb_vx_data {
+    let file_path = unsafe { CStr::from_ptr(file_path) }.to_string_lossy();
+    match crate::full_metadata::open_full_metadata(file_path.as_ref()) {
+        Ok(meta) => Data::from(Box::new(meta)).as_ptr(),
+        Err(e) => {
+            if !error_out.is_null() {
+                let msg = e.to_string();
+                unsafe {
+                    error_out.write(cpp::duckdb_vx_error_create(msg.as_ptr().cast(), msg.len()));
+                }
+            }
+            ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_vortex_full_metadata_row_count(meta: *const c_void) -> u64 {
+    let meta = unsafe { &*(meta as *const crate::full_metadata::FullMetadata) };
+    meta.num_rows
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_vortex_full_metadata_file_size(meta: *const c_void) -> u64 {
+    let meta = unsafe { &*(meta as *const crate::full_metadata::FullMetadata) };
+    meta.file_size_bytes
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_vortex_full_metadata_schema_count(
+    meta: *const c_void,
+) -> usize {
+    let meta = unsafe { &*(meta as *const crate::full_metadata::FullMetadata) };
+    meta.schema.len()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_vortex_full_metadata_schema_at(
+    meta: *const c_void,
+    index: usize,
+    out: *mut duckdb_vx_schema_node,
+) -> bool {
+    let meta = unsafe { &*(meta as *const crate::full_metadata::FullMetadata) };
+    let Some(node) = meta.schema.get(index) else {
+        return false;
+    };
+    unsafe {
+        *out = duckdb_vx_schema_node {
+            name: node.name.as_ptr().cast(),
+            name_len: node.name.len(),
+            duckdb_type: node.duckdb_type.as_ptr().cast(),
+            duckdb_type_len: node.duckdb_type.len(),
+            num_children: node.num_children,
+        };
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_vortex_full_metadata_stats_count(
+    meta: *const c_void,
+) -> usize {
+    let meta = unsafe { &*(meta as *const crate::full_metadata::FullMetadata) };
+    meta.stats.len()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_vortex_full_metadata_stat_at(
+    meta: *const c_void,
+    index: usize,
+    out: *mut duckdb_vx_column_stat,
+) -> bool {
+    let meta = unsafe { &*(meta as *const crate::full_metadata::FullMetadata) };
+    let Some(stat) = meta.stats.get(index) else {
+        return false;
+    };
+    unsafe {
+        *out = duckdb_vx_column_stat {
+            column_id: stat.column_id,
+            stats_min: stat
+                .stats_min
+                .as_ref()
+                .map(|s| s.as_ptr().cast())
+                .unwrap_or(ptr::null()),
+            stats_min_len: stat.stats_min.as_ref().map(|s| s.len()).unwrap_or(0),
+            has_stats_min: stat.stats_min.is_some(),
+            stats_max: stat
+                .stats_max
+                .as_ref()
+                .map(|s| s.as_ptr().cast())
+                .unwrap_or(ptr::null()),
+            stats_max_len: stat.stats_max.as_ref().map(|s| s.len()).unwrap_or(0),
+            has_stats_max: stat.stats_max.is_some(),
+            stats_null_count: stat.stats_null_count.unwrap_or(0),
+            has_null_count: stat.stats_null_count.is_some(),
+            stats_num_values: stat.stats_num_values.unwrap_or(0),
+            has_num_values: stat.stats_num_values.is_some(),
+            total_compressed_size: stat.total_compressed_size.unwrap_or(0),
+            has_compressed_size: stat.total_compressed_size.is_some(),
+            contains_nan: stat.contains_nan.unwrap_or(false),
+            has_contains_nan: stat.contains_nan.is_some(),
+        };
+    }
+    true
+}
+
+/// Reads the `ducklake.field_ids` metadata segment from a Vortex file.
+/// Returns a malloc'd buffer (caller frees with `free`) or null when absent.
+/// On I/O/parse error, sets `error_out` and returns null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_vortex_read_ducklake_field_ids(
+    file_path: *const c_char,
+    len_out: *mut usize,
+    error_out: *mut cpp::duckdb_vx_error,
+) -> *mut u8 {
+    if !len_out.is_null() {
+        unsafe { *len_out = 0 };
+    }
+    let file_path = unsafe { CStr::from_ptr(file_path) }.to_string_lossy();
+    let resolved = match read_ducklake_field_ids_metadata(file_path.as_ref()) {
+        Ok(v) => v,
+        Err(e) => {
+            if !error_out.is_null() {
+                let msg = e.to_string();
+                unsafe {
+                    error_out.write(cpp::duckdb_vx_error_create(msg.as_ptr().cast(), msg.len()));
+                }
+            }
+            return ptr::null_mut();
+        }
+    };
+    let Some(bytes) = resolved else {
+        return ptr::null_mut();
+    };
+    if bytes.is_empty() {
+        return ptr::null_mut();
+    }
+    // Caller frees with free(); match C allocator.
+    unsafe extern "C" {
+        fn malloc(size: usize) -> *mut c_void;
+    }
+    let buf = unsafe { malloc(bytes.len()) as *mut u8 };
+    if buf.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+        if !len_out.is_null() {
+            *len_out = bytes.len();
+        }
+    }
+    buf
 }

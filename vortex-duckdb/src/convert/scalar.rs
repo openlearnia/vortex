@@ -191,6 +191,24 @@ impl ToDuckDBScalar for ExtScalar<'_> {
             });
         }
 
+        // DuckDB cannot represent these adapter-specific extension statistics through the C
+        // scalar API without reconstructing their physical vectors. Returning a typed NULL
+        // omits min/max while preserving the actual scan/export path.
+        let id = self.ext_dtype().id();
+        if matches!(
+            id.as_ref(),
+            crate::convert::ext_types::INTERVAL_EXT_ID
+                | crate::convert::ext_types::ENUM_EXT_ID
+                | crate::convert::ext_types::BIT_EXT_ID
+                | crate::convert::ext_types::BIGNUM_EXT_ID
+                | crate::convert::ext_types::HUGEINT_EXT_ID
+                | crate::convert::ext_types::UHUGEINT_EXT_ID
+                | crate::convert::ext_types::VARIANT_EXT_ID
+                | crate::convert::ext_types::TIME_TZ_EXT_ID
+        ) {
+            return Ok(Value::null(&logical_type));
+        }
+
         let Some(temporal) = self.ext_dtype().metadata_opt::<AnyTemporal>() else {
             vortex_bail!("Cannot convert non-temporal extension scalar to duckdb value");
         };

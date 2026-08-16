@@ -20,6 +20,7 @@ mod sequence;
 mod spatial;
 mod struct_;
 mod temporal;
+mod union;
 mod validity;
 mod varbinview;
 mod vector;

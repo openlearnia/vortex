@@ -16,6 +16,7 @@ use crate::exporter::fixed_size_list;
 use crate::exporter::list_view;
 use crate::exporter::primitive;
 use crate::exporter::struct_;
+use crate::exporter::union;
 use crate::exporter::varbinview;
 
 pub(crate) fn new_exporter(
@@ -30,13 +31,13 @@ pub(crate) fn new_exporter(
         Canonical::Decimal(array) => decimal::new_exporter(array, ctx),
         Canonical::VarBinView(array) => varbinview::new_exporter(array, ctx),
         Canonical::List(array) => list_view::new_exporter(array, cache, ctx),
-        Canonical::Map(_) => vortex_bail!("Map arrays can't be exported to DuckDB"),
+        Canonical::Map(array) => {
+            list_view::new_exporter(array.into_data_parts().entries, cache, ctx)
+        }
         Canonical::FixedSizeList(array) => fixed_size_list::new_exporter(array, cache, ctx),
         Canonical::Struct(array) => struct_::new_exporter(array, cache, ctx),
-        Canonical::Union(_) => {
-            vortex_bail!("TODO(connor)[Union]: implement DuckDB export for Union arrays")
-        }
-        Canonical::Extension(ext) => extension::new_exporter(ext, ctx),
+        Canonical::Union(array) => union::new_exporter(array, cache, ctx),
+        Canonical::Extension(ext) => extension::new_exporter(ext, cache, ctx),
         Canonical::Variant(_) => {
             vortex_bail!("Variant arrays can't be exported to DuckDB")
         }

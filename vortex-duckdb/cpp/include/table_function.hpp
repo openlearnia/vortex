@@ -18,6 +18,15 @@ unique_ptr<FunctionData> duckdb_vx_table_function_bind(ClientContext &context,
                                                        vector<LogicalType> &return_types,
                                                        vector<string> &names);
 
+unique_ptr<GlobalTableFunctionState> vortex_table_init_global(ClientContext &context, TableFunctionInitInput &input);
+unique_ptr<LocalTableFunctionState> vortex_table_init_local(TableFunctionInitInput &input,
+                                                            GlobalTableFunctionState *global_state);
+void vortex_table_scan(ClientContext &context, TableFunctionInput &input, DataChunk &output);
+unique_ptr<BaseStatistics> vortex_table_statistics(ClientContext &context, const FunctionData *bind_data,
+                                                   column_t column_index);
+
+duckdb_state register_vortex_full_metadata(DatabaseInstance &db);
+
 struct TableFunctionProjectionExpressionInput {
     const LogicalGet &get;
     const Expression &expression;

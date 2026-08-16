@@ -158,6 +158,11 @@ extern "C" duckdb_logical_type duckdb_vx_create_geometry(const char *crs) {
     return reinterpret_cast<duckdb_logical_type>(copy.release());
 }
 
+extern "C" duckdb_logical_type duckdb_vx_create_variant() {
+    auto copy = make_uniq<LogicalType>(LogicalType::VARIANT());
+    return reinterpret_cast<duckdb_logical_type>(copy.release());
+}
+
 static unique_ptr<TableRef> VortexScanReplacement(ClientContext &context,
                                                   ReplacementScanInput &input,
                                                   optional_ptr<ReplacementScanData>) {

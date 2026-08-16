@@ -3,6 +3,7 @@
 
 mod dtype;
 mod expr;
+pub(crate) mod ext_types;
 mod scalar;
 mod table_filter;
 mod vector;

@@ -16,7 +16,9 @@ use crate::cpp::duckdb_create_array_type;
 use crate::cpp::duckdb_create_decimal_type;
 use crate::cpp::duckdb_create_list_type;
 use crate::cpp::duckdb_create_logical_type;
+use crate::cpp::duckdb_create_map_type;
 use crate::cpp::duckdb_create_struct_type;
+use crate::cpp::duckdb_create_union_type;
 use crate::cpp::duckdb_decimal_scale;
 use crate::cpp::duckdb_decimal_width;
 use crate::cpp::duckdb_destroy_logical_type;
@@ -58,6 +60,43 @@ impl Clone for LogicalType {
 impl LogicalType {
     pub fn new(dtype: DUCKDB_TYPE) -> Self {
         unsafe { Self::own(duckdb_create_logical_type(dtype)) }
+    }
+
+    /// Creates a DuckDB MAP logical type.
+    pub fn map_type(key_type: LogicalType, value_type: LogicalType) -> VortexResult<LogicalType> {
+        let ptr = unsafe { duckdb_create_map_type(key_type.as_ptr(), value_type.as_ptr()) };
+        if ptr.is_null() {
+            vortex_bail!("Failed to create map logical type");
+        }
+        Ok(unsafe { Self::own(ptr) })
+    }
+
+    /// Creates a DuckDB UNION logical type.
+    pub fn union_type<T, N>(member_types: T, member_names: N) -> VortexResult<LogicalType>
+    where
+        T: IntoIterator<Item = LogicalType>,
+        N: IntoIterator<Item = CString>,
+    {
+        let member_types: Vec<LogicalType> = member_types.into_iter().collect();
+        let member_names: Vec<CString> = member_names.into_iter().collect();
+        if member_types.len() != member_names.len() {
+            vortex_bail!("UNION member types/names length mismatch");
+        }
+        let mut type_ptrs: Vec<duckdb_logical_type> =
+            member_types.iter().map(|lt| lt.as_ptr()).collect();
+        let mut name_ptrs: Vec<*const std::ffi::c_char> =
+            member_names.iter().map(|n| n.as_ptr()).collect();
+        let ptr = unsafe {
+            duckdb_create_union_type(
+                type_ptrs.as_mut_ptr(),
+                name_ptrs.as_mut_ptr(),
+                member_types.len() as _,
+            )
+        };
+        if ptr.is_null() {
+            vortex_bail!("Failed to create union logical type");
+        }
+        Ok(unsafe { Self::own(ptr) })
     }
 
     /// Creates a DuckDB struct logical type from child types and field names.
