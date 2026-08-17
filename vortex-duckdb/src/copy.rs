@@ -33,11 +33,14 @@ use vortex::dtype::FieldName;
 use vortex::dtype::Nullability::NonNullable;
 use vortex::dtype::Nullability::Nullable;
 use vortex::dtype::StructFields;
+use vortex::editions::ComponentKind;
+use vortex::editions::EditionSessionExt;
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 use vortex::error::vortex_err;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::file::WriteOptionsSessionExt;
+use vortex::file::WriteStrategyBuilder;
 use vortex::file::WriteSummary;
 use vortex::file::multi::parse_uri_or_path;
 use vortex::io::VortexWrite;
@@ -76,6 +79,19 @@ pub struct ExportedColumnStatistics {
 
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn copy_write_options() -> vortex::file::VortexWriteOptions {
+    let strategy = WriteStrategyBuilder::default()
+        .with_allow_encodings(
+            SESSION
+                .enabled_component_ids(ComponentKind::Array)
+                .into_iter()
+                .collect(),
+        )
+        .for_ingest()
+        .build();
+    SESSION.write_options().with_strategy(strategy)
 }
 
 fn join_stats_path(prefix: &str, name: &str) -> String {
@@ -543,7 +559,7 @@ pub fn copy_to_initialize_global(
                 .create(true)
                 .open(file_path)
                 .await?;
-            let mut options = SESSION.write_options();
+            let mut options = copy_write_options();
             if let Some(meta) = field_ids_metadata {
                 options = options.with_metadata_segment(DUCKLAKE_FIELD_IDS_METADATA_KEY, meta);
             }
@@ -559,7 +575,7 @@ pub fn copy_to_initialize_global(
         let object_store = Arc::new(Compat::new(object_store)) as Arc<dyn ObjectStore>;
         handle.spawn(async move {
             let mut writer = ObjectStoreWrite::new(object_store, &path).await?;
-            let mut options = SESSION.write_options();
+            let mut options = copy_write_options();
             if let Some(meta) = field_ids_metadata {
                 options = options.with_metadata_segment(DUCKLAKE_FIELD_IDS_METADATA_KEY, meta);
             }

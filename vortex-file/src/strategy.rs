@@ -180,21 +180,16 @@ impl WriteStrategyBuilder {
     /// Tune the default pipeline for high-ingest writers (e.g. DuckDB `COPY`).
     ///
     /// Drops schemes that rarely win on flat analytics tables but still pay sample-compress
-    /// cost, and coalesces toward 2 MiB uncompressed blocks so FSST/BtrBlocks run less often.
+    /// cost, and coalesces toward 8 MiB uncompressed blocks so FSST/BtrBlocks run less often.
     /// Keeps FSST and dictionary schemes that dominate TPC-H string columns.
-    ///
-    /// Not wired as the DuckDB COPY default yet: SF1 isolated CTAS stayed ~1.38× Parquet with
-    /// this preset (FSST encode dominates), while bytes grew ~1%.
     pub fn for_ingest(self) -> Self {
-        self.with_btrblocks_builder(
-            BtrBlocksCompressorBuilder::default().exclude_schemes([
-                RunEndScheme.id(),
-                IntRLEScheme.id(),
-                ALPRDScheme.id(),
-                FloatRLEScheme.id(),
-            ]),
-        )
-        .with_data_block_target_bytes(Some(2 * ONE_MEG))
+        self.with_btrblocks_builder(BtrBlocksCompressorBuilder::default().exclude_schemes([
+            RunEndScheme.id(),
+            IntRLEScheme.id(),
+            ALPRDScheme.id(),
+            FloatRLEScheme.id(),
+        ]))
+        .with_data_block_target_bytes(Some(8 * ONE_MEG))
     }
 
     /// Builds the canonical [`LayoutStrategy`] implementation, with the configured overrides
@@ -350,9 +345,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn for_ingest_uses_two_megabyte_blocks() {
+    fn for_ingest_uses_eight_megabyte_blocks() {
         let builder = WriteStrategyBuilder::default().for_ingest();
-        assert_eq!(builder.data_block_target_bytes, Some(2 * ONE_MEG));
+        assert_eq!(builder.data_block_target_bytes, Some(8 * ONE_MEG));
         assert_eq!(builder.row_block_size, 8192);
     }
 }
