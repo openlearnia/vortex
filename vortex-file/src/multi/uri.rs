@@ -200,4 +200,33 @@ mod tests {
         );
         Ok(())
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_literal_percent_in_os_path_round_trips_via_to_file_path() -> VortexResult<()> {
+        // Hive writers put URL-encoded spaces on disk as literal `%20` path segments.
+        // Url::from_file_path encodes that `%` again (`%2520`); consumers must use
+        // to_file_path() to recover the OS path, not url.path().
+        let input = "/tmp/category=home%20appliances/data.vortex";
+        let url = parse_uri_or_path(input)?;
+        assert_eq!(url.scheme(), "file");
+        assert!(
+            url.path().contains("%2520"),
+            "from_file_path should percent-encode literal %; got {}",
+            url.path()
+        );
+        let os_path = url
+            .to_file_path()
+            .map_err(|_| vortex_err!("to_file_path failed for {url}"))?;
+        let os = os_path.to_string_lossy();
+        assert!(
+            os.contains("home%20appliances"),
+            "OS path must keep single-encoded hive segment; got {os}"
+        );
+        assert!(
+            !os.contains("%2520"),
+            "OS path must not double-encode; got {os}"
+        );
+        Ok(())
+    }
 }

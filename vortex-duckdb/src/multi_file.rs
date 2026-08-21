@@ -28,9 +28,17 @@ fn resolve_filesystem(glob_url: &Url) -> VortexResult<(FileSystemRef, String)> {
     // Compat makes us use tokio which is very bad for local reads on
     // high-core machines because reads go into blocking pool
     if glob_url.scheme() == "file" {
+        // Prefer to_file_path over url.path(): Url::from_file_path percent-encodes
+        // literal `%` in OS paths (hive dirs like `category=home%20appliances`), and
+        // path() keeps that encoding (`%2520`). Local globs need the decoded OS path.
+        let path = glob_url
+            .to_file_path()
+            .map_err(|_| vortex_err!("invalid file URL: {glob_url}"))?
+            .to_string_lossy()
+            .into_owned();
         return Ok((
             Arc::new(ObjectStoreFileSystem::local(RUNTIME.handle())),
-            glob_url.path().to_string(),
+            path,
         ));
     }
 
