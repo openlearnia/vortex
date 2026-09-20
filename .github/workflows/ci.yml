@@ -22,7 +22,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  NIGHTLY_TOOLCHAIN: nightly-2026-02-05
+  NIGHTLY_TOOLCHAIN: nightly-2026-09-10
 
 jobs:
   duckdb-mirror:
@@ -68,15 +68,16 @@ jobs:
     name: "Python (lint)"
     runs-on: >-
       ${{ github.repository == 'vortex-data/vortex'
-          && format('runs-on={0}/runner=amd64-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=python-lint', github.run_id)
+          && format('runs-on={0}/runner=amd64-ci-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=python-lint', github.run_id)
           || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
-      - uses: runs-on/action@v2
-        if: github.repository == 'vortex-data/vortex'
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: runs-on/action@v2
+            if: github.repository == 'vortex-data/vortex'
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"
@@ -85,30 +86,31 @@ jobs:
         run: uvx ruff format --check .
       - name: Python Lint - Ruff
         run: uvx ruff check .
-      # PyRight needs the project for type information, so use uv run
-      - name: Python Lint - PyRight
-        env:
-          MATURIN_PEP517_ARGS: "--profile ci"
+      # ty needs the Python dependencies for type information, but resolves the
+      # vortex package itself from the in-tree sources and stubs, so skip the
+      # Rust extension build entirely.
+      - name: Python Lint - ty
         run: |
-          uv sync --all-packages
-          uv run basedpyright vortex-python
+          uv sync --all-packages --no-install-workspace
+          uvx ty check vortex-python vortex-python-cuda vortex-ffi/cmake/tests scripts/tests
 
   python-test:
     name: "Python (test)"
     runs-on: >-
       ${{ github.repository == 'vortex-data/vortex'
-          && format('runs-on={0}/runner=amd64-large/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=python-test', github.run_id)
+          && format('runs-on={0}/runner=amd64-ci-large/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=python-test', github.run_id)
           || 'ubuntu-latest' }}
     timeout-minutes: 30
     env:
       RUST_LOG: "info,maturin=off,uv=debug"
       MATURIN_PEP517_ARGS: "--profile ci"
     steps:
-      - uses: runs-on/action@v2
-        if: github.repository == 'vortex-data/vortex'
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: runs-on/action@v2
+            if: github.repository == 'vortex-data/vortex'
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"
@@ -141,6 +143,69 @@ jobs:
           bash ../scripts/bench-taskset.sh uv run --all-packages pytest --benchmark-only benchmark/
         working-directory: vortex-python/
 
+  python-windows:
+    name: "Python (windows-x64)"
+    timeout-minutes: 60
+    runs-on: >-
+      ${{ github.repository == 'vortex-data/vortex'
+          && format('runs-on={0}/pool=windows-x64-pre/extras=s3-cache', github.run_id)
+          || 'windows-latest' }}
+    steps:
+      - uses: runs-on/action@v2
+        if: github.repository == 'vortex-data/vortex'
+        with:
+          sccache: s3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - name: Setup (Windows)
+        run: |
+          echo "C:\rust\cargo\bin" >> $env:GITHUB_PATH
+      - uses: ./.github/actions/setup-prebuild
+        with:
+          enable-sccache: "true"
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
+        with:
+          python-version: "3.11"
+
+      # Mirrors the wheel build in package.yml, which spells the Windows interpreter
+      # `python` because maturin has no `python3.11` executable to resolve there.
+      - name: Build wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b  # v1
+        with:
+          command: build
+          maturin-version: 1.15.0
+          target: x86_64-pc-windows-msvc
+          args: >
+            --profile ci
+            --manifest-path vortex-python/Cargo.toml
+            --out dist
+            --interpreter python
+        env:
+          # Keep this constant to avoid pyo3 invalidating itself
+          PYO3_ENVIRONMENT_SIGNATURE: "cpython3"
+
+      # rust-test-windows excludes vortex-python, so this is the only check that the
+      # win_amd64 wheel imports and can round-trip a file. Runs outside the checkout so
+      # the repo-root `vortex/` crate directory cannot shadow the installed package.
+      - name: Import and round-trip the wheel
+        shell: bash
+        run: |
+          python -m pip install dist/*.whl
+          cd "$RUNNER_TEMP"
+          python - <<'PY'
+          import pyarrow as pa
+
+          import vortex as vx
+
+          table = pa.table({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+          vx.io.write(table, "smoke.vortex")
+          # Vortex reads utf8 back as string_view, so compare column-wise rather than by table.
+          round_tripped = vx.open("smoke.vortex").to_arrow().read_all()
+          assert round_tripped.column_names == table.column_names
+          assert round_tripped.column("a").to_pylist() == [1, 2, 3]
+          assert round_tripped.column("b").to_pylist() == ["x", "y", "z"]
+          print("vortex", vx.__version__, "round-tripped a file on Windows")
+          PY
+
   # Pins the measurement_id hash that scripts/post-ingest.py uses as the primary key of every
   # benchmarks-database fact row. The golden vectors are a frozen artifact (see the note inside
   # the JSON); this job fails if a change to scripts/_measurement_id.py drifts the hash, which
@@ -161,6 +226,21 @@ jobs:
           uv run --no-project --with pytest --with xxhash \
             pytest scripts/tests/test_measurement_id.py
 
+  benchmark-reporting:
+    name: "Benchmark reporting"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      # sync: false -- the tests run via `uv run --no-project` and need no workspace packages.
+      - uses: spiraldb/actions/.github/actions/setup-uv@a746510eafaa926484c354541cfc49b2ec06cc63  # 0.18.6
+        with:
+          sync: false
+      - name: Pytest - benchmark reporting
+        run: |
+          uv run --no-project --with pytest --with pandas --with numpy --with orjson \
+            --with tabulate pytest scripts/tests/test_benchmark_reporting.py
+
   python-cuda-test:
     name: "Python CUDA (test)"
     if: github.repository == 'vortex-data/vortex'
@@ -170,23 +250,25 @@ jobs:
       RUST_LOG: "info,maturin=off,uv=debug"
       MATURIN_PEP517_ARGS: "--profile ci"
     steps:
-      - uses: runs-on/action@v2
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-      - uses: ./.github/actions/setup-rust
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          components: cargo
-          enable-sccache: "true"
+      - parallel:
+          - uses: runs-on/action@v2
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: ./.github/actions/setup-rust
+            with:
+              repo-token: ${{ secrets.GITHUB_TOKEN }}
+              components: cargo
+              enable-sccache: "true"
+          - name: Install uv
+            uses: spiraldb/actions/.github/actions/setup-uv@a746510eafaa926484c354541cfc49b2ec06cc63  # 0.18.6
+            with:
+              sync: false
       - name: Pin rustup proxy to repository toolchain
         run: |
           TOOLCHAIN="$(grep '^channel' rust-toolchain.toml | cut -d '"' -f 2)"
           echo "RUSTUP_TOOLCHAIN=$TOOLCHAIN" >> "$GITHUB_ENV"
-      - name: Install uv
-        uses: spiraldb/actions/.github/actions/setup-uv@a746510eafaa926484c354541cfc49b2ec06cc63  # 0.18.6
-        with:
-          sync: false
 
       - name: Pytest - PyVortex CUDA bridge
         run: |
@@ -197,17 +279,20 @@ jobs:
   rust-docs:
     name: "Rust (docs)"
     needs: duckdb-ready
+    # The PR-only mirror is a skipped ancestor on develop; override implicit success().
+    if: ${{ !cancelled() && needs.duckdb-ready.result == 'success' }}
     timeout-minutes: 30
     runs-on: >-
       ${{ github.repository == 'vortex-data/vortex'
-          && format('runs-on={0}/runner=amd64-small/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=rust-docs', github.run_id)
+          && format('runs-on={0}/runner=amd64-ci-small/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=rust-docs', github.run_id)
           || 'ubuntu-latest' }}
     steps:
-      - uses: runs-on/action@v2
-        if: github.repository == 'vortex-data/vortex'
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: runs-on/action@v2
+            if: github.repository == 'vortex-data/vortex'
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"
@@ -229,41 +314,37 @@ jobs:
       ${{ github.repository == 'vortex-data/vortex'
           && format('runs-on={0}/runner={1}/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag={2}', github.run_id, matrix.config.runner, matrix.config.name)
           || 'ubuntu-latest' }}
-    env:
-      # disable lints for build, they will be caught in Rust lint job.
-      RUSTFLAGS: "-A warnings"
     strategy:
       fail-fast: false
       matrix:
         config:
           - name: "all-features"
-            runner: amd64-large
+            runner: amd64-ci-large
             args: "--all-features --all-targets"
           - name: "default features"
-            runner: amd64-large
+            runner: amd64-ci-large
             args: "--all-targets"
           - name: "with tokio dispatcher"
-            runner: amd64-small
+            runner: amd64-ci-small
             # Only build the crates that have the tokio features, not re-building other crates with no-default-features
             args: "--no-default-features --features tokio --all-targets -p vortex -p vortex-io -p vortex-file -p vortex-layout"
           - name: "wasm32 with default features"
-            runner: amd64-medium
+            runner: amd64-ci-medium
             target: wasm32-unknown-unknown
             env:
               rustflags: "RUSTFLAGS='-A warnings --cfg getrandom_backend=\"unsupported\"'"
             args: "--target wasm32-unknown-unknown --exclude vortex --exclude vortex-cuda --exclude vortex-cub --exclude vortex-nvcomp --exclude vortex-datafusion --exclude vortex-duckdb --exclude vortex-tui --exclude vortex-zstd --exclude vortex-test-e2e-cuda --exclude vortex-python-cuda --exclude vortex-sqllogictest --exclude vortex-parquet-variant"
     steps:
-      - uses: runs-on/action@v2
-        if: github.repository == 'vortex-data/vortex'
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: runs-on/action@v2
+            if: github.repository == 'vortex-data/vortex'
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"
-      - name: Install wasm32 target
-        if: matrix.config.target == 'wasm32-unknown-unknown'
-        run: rustup target add wasm32-unknown-unknown
+          targets: ${{ matrix.config.target }}
       - uses: ./.github/actions/check-rebuild
         with:
           command: "${{matrix.config.env.rustflags}} cargo hack build --profile ci --locked ${{matrix.config.args}} --ignore-private"
@@ -271,20 +352,24 @@ jobs:
         run: |
           git status --porcelain
           test -z "$(git status --porcelain)"
+      - name: sccache stats
+        if: always() && github.repository == 'vortex-data/vortex'
+        run: sccache --show-stats
 
   check-min-deps:
     name: "Check build with minimal dependencies"
     timeout-minutes: 30
     runs-on: >-
       ${{ github.repository == 'vortex-data/vortex'
-          && format('runs-on={0}/runner=amd64-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=rust-min-deps', github.run_id)
+          && format('runs-on={0}/runner=amd64-ci-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=rust-min-deps', github.run_id)
           || 'ubuntu-latest' }}
     steps:
-      - uses: runs-on/action@v2
-        if: github.repository == 'vortex-data/vortex'
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: runs-on/action@v2
+            if: github.repository == 'vortex-data/vortex'
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"
@@ -295,16 +380,17 @@ jobs:
     timeout-minutes: 30
     runs-on: >-
       ${{ github.repository == 'vortex-data/vortex'
-          && format('runs-on={0}/runner=amd64-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=rust-msrv', github.run_id)
+          && format('runs-on={0}/runner=amd64-ci-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=rust-msrv', github.run_id)
           || 'ubuntu-latest' }}
     env:
       RUSTFLAGS: "-A warnings"
     steps:
-      - uses: runs-on/action@v2
-        if: github.repository == 'vortex-data/vortex'
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: runs-on/action@v2
+            if: github.repository == 'vortex-data/vortex'
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"
@@ -314,30 +400,30 @@ jobs:
   rust-lint:
     name: "Rust (lint)"
     needs: duckdb-ready
+    if: ${{ !cancelled() && needs.duckdb-ready.result == 'success' }}
     timeout-minutes: 30
     runs-on: >-
       ${{ github.repository == 'vortex-data/vortex'
-          && format('runs-on={0}/runner=amd64-large/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=rust-lint', github.run_id)
+          && format('runs-on={0}/runner=amd64-ci-large/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=rust-lint', github.run_id)
           || 'ubuntu-latest' }}
     steps:
-      - uses: runs-on/action@v2
-        if: github.repository == 'vortex-data/vortex'
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: runs-on/action@v2
+            if: github.repository == 'vortex-data/vortex'
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"
       - name: Install nightly for fmt
         run: rustup toolchain install $NIGHTLY_TOOLCHAIN --component rustfmt
+      # Run one Cargo command at a time so it can use the whole runner and reuse
+      # artifacts from the shared target directory in subsequent checks.
       - name: Rust Lint - Format
         id: fmt
         continue-on-error: true
         run: cargo +$NIGHTLY_TOOLCHAIN fmt --all --check
-      - name: Rustc check
-        id: check
-        continue-on-error: true
-        run: RUSTFLAGS="-D warnings" cargo check --profile ci --locked --all-features --all-targets
       - name: Rustc check (release)
         id: check-release
         continue-on-error: true
@@ -357,7 +443,6 @@ jobs:
           script: |
             const failed = Object.entries({
               fmt: '${{ steps.fmt.outcome }}',
-              check: '${{ steps.check.outcome }}',
               'check-release': '${{ steps.check-release.outcome }}',
               'clippy-all': '${{ steps.clippy-all.outcome }}',
               'clippy-default': '${{ steps.clippy-default.outcome }}',
@@ -377,6 +462,32 @@ jobs:
             }
             core.setFailed(`Lint failed: ${failed.join(', ')}`);
 
+      - name: sccache stats
+        if: always() && github.repository == 'vortex-data/vortex'
+        run: sccache --show-stats
+
+  rust-lint-no-default:
+    name: "Rust (lint, no default)"
+    timeout-minutes: 30
+    runs-on: >-
+      ${{ github.repository == 'vortex-data/vortex'
+          && format('runs-on={0}/runner=amd64-ci-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=rust-lint-no-default', github.run_id)
+          || 'ubuntu-latest' }}
+    steps:
+      - parallel:
+          - uses: runs-on/action@v2
+            if: github.repository == 'vortex-data/vortex'
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: ./.github/actions/setup-prebuild
+        with:
+          enable-sccache: "true"
+      - name: Rust Lint - Clippy No Default Features
+        shell: bash
+        run: |
+          cargo hack --no-dev-deps --ignore-private clippy --profile ci --no-default-features -- -D warnings
+
   cpp-lint:
     name: "C/C++ (lint)"
     runs-on: ubuntu-latest
@@ -392,41 +503,22 @@ jobs:
             | grep -v 'kernels/src/bit_unpack_.*_lanes\.cuh$' \
             | xargs clang-format --dry-run --Werror --style=file
 
-  rust-lint-no-default:
-    name: "Rust (lint, no default)"
-    timeout-minutes: 30
-    runs-on: >-
-      ${{ github.repository == 'vortex-data/vortex'
-          && format('runs-on={0}/runner=amd64-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=rust-lint-no-default', github.run_id)
-          || 'ubuntu-latest' }}
-    steps:
-      - uses: runs-on/action@v2
-        if: github.repository == 'vortex-data/vortex'
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-      - uses: ./.github/actions/setup-prebuild
-        with:
-          enable-sccache: "true"
-      - name: Rust Lint - Clippy No Default Features
-        shell: bash
-        run: |
-          cargo hack --no-dev-deps --ignore-private clippy --profile ci --no-default-features -- -D warnings
-
   rust-test-windows:
     name: "Rust tests (windows-x64)"
     needs: duckdb-ready
+    if: ${{ !cancelled() && needs.duckdb-ready.result == 'success' }}
     timeout-minutes: 30
     runs-on: >-
       ${{ github.repository == 'vortex-data/vortex'
           && format('runs-on={0}/pool=windows-x64-pre/extras=s3-cache', github.run_id)
           || 'windows-latest' }}
     steps:
-      - uses: runs-on/action@v2
-        if: github.repository == 'vortex-data/vortex'
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: runs-on/action@v2
+            if: github.repository == 'vortex-data/vortex'
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - name: Setup (Windows)
         run: |
           echo "C:\rust\cargo\bin" >> $env:GITHUB_PATH
@@ -460,14 +552,17 @@ jobs:
   rust-test-linux-arm64:
     name: "Rust tests (linux-arm64)"
     needs: duckdb-ready
-    if: github.repository == 'vortex-data/vortex'
+    if: >-
+      !cancelled() && needs.duckdb-ready.result == 'success' &&
+      github.repository == 'vortex-data/vortex'
     timeout-minutes: 30
     runs-on: runs-on=${{ github.run_id }}/runner=arm64-medium/image=ubuntu24-full-arm64-pre-v2/extras=s3-cache/tag=rust-test-linux-arm64
     steps:
-      - uses: runs-on/action@v2
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: runs-on/action@v2
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"
@@ -491,52 +586,49 @@ jobs:
     timeout-minutes: 10
     runs-on: >-
       ${{ github.repository == 'vortex-data/vortex'
-          && format('runs-on={0}/runner=amd64-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=btrblocks-golden', github.run_id)
+          && format('runs-on={0}/runner=amd64-ci-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=btrblocks-golden', github.run_id)
           || 'ubuntu-latest' }}
     steps:
-      - uses: runs-on/action@v2
-        if: github.repository == 'vortex-data/vortex'
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: runs-on/action@v2
+            if: github.repository == 'vortex-data/vortex'
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"
-      # The golden suite pins the compressor's decisions per feature variant, and the
-      # variants are mutually exclusive at compile time: the `default` variant only exists
-      # without `unstable_encodings` (which changes ALL_SCHEMES), so the `--all-features`
-      # workspace test jobs cannot run it. Run each feature combination explicitly.
-      - name: Golden corpus (default features)
+      # The golden suite pins compressor decisions for the core-only and explicitly enabled
+      # edition configurations. Compact compression additionally needs its optional schemes.
+      - name: Golden corpus (edition configurations)
         run: |
           cargo nextest run --cargo-profile ci --locked --no-fail-fast -p vortex-btrblocks --test golden
-      - name: Golden corpus (unstable_encodings)
+      - name: Golden corpus (compact, zstd + pco)
         run: |
           cargo nextest run --cargo-profile ci --locked --no-fail-fast -p vortex-btrblocks --test golden \
-            --features unstable_encodings
-      - name: Golden corpus (compact, unstable_encodings + zstd + pco)
-        run: |
-          cargo nextest run --cargo-profile ci --locked --no-fail-fast -p vortex-btrblocks --test golden \
-            --features unstable_encodings,zstd,pco
+            --features zstd,pco -E 'test(golden_compact)'
 
   build-java:
     name: "Java"
     runs-on: >-
       ${{ github.repository == 'vortex-data/vortex'
-          && format('runs-on={0}/pool=amd64-medium-pre-v2/extras=s3-cache/tag=java', github.run_id)
+          && format('runs-on={0}/runner=amd64-ci-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=java', github.run_id)
           || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
-      - uses: runs-on/action@v2
-        if: github.repository == 'vortex-data/vortex'
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-      - uses: ./.github/actions/setup-prebuild
-        with:
-          enable-sccache: "true"
-      - run: ./gradlew javadoc
-        working-directory: ./java
-      - run: ./gradlew check
+      - parallel:
+          - uses: runs-on/action@v2
+            if: github.repository == 'vortex-data/vortex'
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: ./.github/actions/setup-prebuild
+            with:
+              enable-sccache: "true"
+          - uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb  # v6
+      - name: Build documentation and run Java checks
+        run: ./gradlew --parallel javadoc check
         working-directory: ./java
 
   license-check-and-audit-check:
@@ -556,42 +648,68 @@ jobs:
         with:
           command: check ${{ matrix.checks }}
 
-  cxx-api:
-    name: "C++ API"
-    timeout-minutes: 5
+  cmake-integration-test:
+    name: "CMake integration (test)"
+    timeout-minutes: 10
     runs-on: >-
       ${{ github.repository == 'vortex-data/vortex'
-          && format('runs-on={0}/runner=amd64-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=cxx-build', github.run_id)
+          && format('runs-on={0}/runner=amd64-ci-medium/image=ubuntu24-full-x64-pre-v2/tag=cmake-integration-test', github.run_id)
           || 'ubuntu-latest' }}
     steps:
       - uses: runs-on/action@v2
         if: github.repository == 'vortex-data/vortex'
-        with:
-          sccache: s3
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: ./.github/actions/setup-prebuild
+      - name: Install Ninja for CMake integration tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+      # Populate the registry cache for the lockfile-selected offline fixtures.
+      - name: Fetch Cargo dependencies for offline fixtures
+        run: cargo fetch --locked
+      - name: Test CMake integration
+        run: python3 -m unittest discover -s vortex-ffi/cmake/tests -v
+
+  cxx-api:
+    name: "C++ API"
+    # Leave room for cold, per-build-tree Cargo artifacts, including sanitized std.
+    timeout-minutes: 15
+    env:
+      # symbolizing error backtrace on debug .so is slow
+      RUST_LIB_BACKTRACE: 0
+    runs-on: >-
+      ${{ github.repository == 'vortex-data/vortex'
+          && format('runs-on={0}/runner=amd64-ci-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=cxx-build', github.run_id)
+          || 'ubuntu-latest' }}
+    steps:
+      - parallel:
+          - uses: runs-on/action@v2
+            if: github.repository == 'vortex-data/vortex'
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"
-      - name: Install Rust nightly toolchain
-        run: |
-          rustup toolchain install $NIGHTLY_TOOLCHAIN
-          rustup component add --toolchain $NIGHTLY_TOOLCHAIN rust-src rustfmt clippy llvm-tools-preview
-      - name: Build FFI library (asan)
-        run: |
-          RUSTFLAGS="-A warnings -Cunsafe-allow-abi-mismatch=sanitizer \
-                -C debuginfo=2 -C opt-level=0 -C strip=none -Zexternal-clangrt \
-                -Zsanitizer=address,leak" \
-          cargo +$NIGHTLY_TOOLCHAIN build --locked --no-default-features \
-            --target x86_64-unknown-linux-gnu -Zbuild-std \
-            -p vortex-ffi
+          toolchain: ${{ env.NIGHTLY_TOOLCHAIN }}
+          components: "rust-src, rustfmt, clippy, llvm-tools-preview"
       - name: Build C++ tests and examples (asan)
+        env:
+          RUSTUP_TOOLCHAIN: ${{ env.NIGHTLY_TOOLCHAIN }}
         run: |
-          mkdir -p build
-          cmake -S lang/cpp -Bbuild -DSANITIZER=asan -DBUILD_TESTS=1 -DBUILD_EXAMPLES=1 -DTARGET_TRIPLE="x86_64-unknown-linux-gnu"
-          cmake --build build --parallel $(nproc)
+          cmake -S lang/cpp -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_LINKER_TYPE=MOLD \
+            -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DVORTEX_SANITIZER=asan \
+            -DVORTEX_SANITIZE_RUST_STD=ON \
+            -DVORTEX_BUILD_TESTS=ON \
+            -DVORTEX_BUILD_EXAMPLES=ON
+          cmake --build build --parallel "$(nproc)"
       - name: Run C++ tests
-        run: |
-          build/tests/vortex_cxx_test
+        run: ctest --test-dir build --output-on-failure
       - name: Run C++ examples
         run: |
           cd build/examples
@@ -607,122 +725,178 @@ jobs:
   sqllogic-test:
     name: "SQL logic tests"
     needs: duckdb-ready
+    if: ${{ !cancelled() && needs.duckdb-ready.result == 'success' }}
     runs-on: >-
       ${{ github.repository == 'vortex-data/vortex'
-          && format('runs-on={0}/runner=amd64-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=sql-logic-test', github.run_id)
+          && format('runs-on={0}/runner=amd64-ci-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=sql-logic-test', github.run_id)
           || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
-      - uses: runs-on/action@v2
-        if: github.repository == 'vortex-data/vortex'
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: runs-on/action@v2
+            if: github.repository == 'vortex-data/vortex'
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"
       - name: Run sqllogictest tests
         run: |
-          ./vortex-sqllogictest/slt/tpch/generate_data.sh
+          VORTEX_SLT_PROFILE=ci ./vortex-sqllogictest/slt/generate_data.sh
           cargo nextest run --cargo-profile ci -p vortex-sqllogictest
       - uses: ./.github/actions/check-rebuild
         with:
           command: "cargo nextest run --cargo-profile ci -p vortex-sqllogictest --no-run"
           message-format-flag: "--cargo-message-format"
 
+  duckdb-s3-test:
+    name: "DuckDB S3 tests"
+    needs: duckdb-ready
+    if: ${{ !cancelled() && needs.duckdb-ready.result == 'success' }}
+    runs-on: >-
+      ${{ github.repository == 'vortex-data/vortex'
+          && format('runs-on={0}/runner=amd64-ci-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=duckdb-s3-test', github.run_id)
+          || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    steps:
+      - parallel:
+          - uses: runs-on/action@v2
+            if: github.repository == 'vortex-data/vortex'
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: ./.github/actions/setup-prebuild
+        with:
+          enable-sccache: "true"
+      - parallel:
+          - name: Build DuckDB tests
+            shell: bash
+            run: |
+              cargo nextest run --cargo-profile ci --locked -p vortex-duckdb --no-run
+          - name: Start RustFS
+            shell: bash
+            run: |
+              curl -sSL https://dl.rustfs.com/artifacts/rustfs/release/rustfs-linux-x86_64-musl-latest.zip \
+                -o "${RUNNER_TEMP}/rustfs.zip"
+              unzip -o -q "${RUNNER_TEMP}/rustfs.zip" rustfs -d "${RUNNER_TEMP}"
+              chmod +x "${RUNNER_TEMP}/rustfs"
+              mkdir -p "${RUNNER_TEMP}/rustfs-data"
+              RUSTFS_ACCESS_KEY=rustfsadmin RUSTFS_SECRET_KEY=rustfsadmin \
+                "${RUNNER_TEMP}/rustfs" "${RUNNER_TEMP}/rustfs-data" --address 127.0.0.1:9000 &
+              until curl -sf http://127.0.0.1:9000/health; do sleep 1; done
+              curl -sf -X PUT "http://127.0.0.1:9000/vortex-test" \
+                --user "rustfsadmin:rustfsadmin" --aws-sigv4 "aws:amz:us-east-1:s3"
+      - name: Run tests
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: rustfsadmin
+          AWS_SECRET_ACCESS_KEY: rustfsadmin
+          AWS_ENDPOINT: "http://127.0.0.1:9000"
+          AWS_REGION: "us-east-1"
+          AWS_ALLOW_HTTP: "true"
+          VORTEX_DUCKDB_S3_URI: "s3://vortex-test/duckdb"
+        run: |
+          cargo nextest run --cargo-profile ci --locked -p vortex-duckdb --run-ignored all s3_
+
   wasm-integration:
     name: "WASM integration smoke test"
     timeout-minutes: 30
     runs-on: >-
       ${{ github.repository == 'vortex-data/vortex'
-          && format('runs-on={0}/runner=amd64-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=wasm-integration', github.run_id)
+          && format('runs-on={0}/runner=amd64-ci-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=wasm-integration', github.run_id)
           || 'ubuntu-latest' }}
     steps:
-      - uses: runs-on/action@v2
-        if: github.repository == 'vortex-data/vortex'
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-      - uses: ./.github/actions/setup-prebuild
-        with:
-          enable-sccache: "true"
-          targets: "wasm32-wasip1"
-      - name: Install wasm32-wasip1 target
-        run: rustup target add wasm32-wasip1
-      - name: Setup Wasmer
-        shell: bash
-        run: |
-          curl https://get.wasmer.io -sSfL | sh
-          echo "$HOME/.wasmer/bin" >> $GITHUB_PATH
+      - parallel:
+          - uses: runs-on/action@v2
+            if: github.repository == 'vortex-data/vortex'
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: ./.github/actions/setup-prebuild
+            with:
+              enable-sccache: "true"
+              targets: "wasm32-wasip1"
+          - name: Setup Wasmer
+            uses: wasmerio/setup-wasmer@ba7631cb2d521612aa7ac5b13cb76fb77e824a1a  # v3
+            with:
+              version: "v7.4.0"
+      - name: Verify Wasmer installation
+        run: wasmer --version
       - run: cargo build --profile ci --target wasm32-wasip1
         working-directory: ./wasm-test
       - run: wasmer run ./target/wasm32-wasip1/ci/wasm-test.wasm
         working-directory: ./wasm-test
 
   generated-files:
-    name: "Check generated source files are up to date"
+    name: "Generated source files and C API"
     runs-on: >-
       ${{ github.repository == 'vortex-data/vortex'
-          && format('runs-on={0}/runner=amd64-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=generated-files', github.run_id)
+          && format('runs-on={0}/runner=amd64-ci-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=generated-files', github.run_id)
           || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
-      - uses: runs-on/action@v2
-        if: github.repository == 'vortex-data/vortex'
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: runs-on/action@v2
+            if: github.repository == 'vortex-data/vortex'
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+            with:
+              # check-editions compares against the merge base, so it needs real history.
+              fetch-depth: 0
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"
+      - uses: ./.github/actions/setup-flatc
       - name: Install nightly for cbindgen macro expansion
         run: rustup toolchain install $NIGHTLY_TOOLCHAIN
-      - name: "regenerate all .fbs/.proto Rust code"
+      - name: "regenerate the edition records"
         run: |
-          cargo run --profile ci -p xtask -- generate-fbs
-          cargo run --profile ci -p xtask -- generate-proto
-      - name: "regenerate FFI header file"
+          cargo run --profile ci -p xtask -- generate-editions
+      - name: "check frozen edition records never change"
+        # Independent of the regeneration above: a stale record must not mask a frozen one
+        # being edited, nor the other way round.
+        if: "!cancelled()"
         run: |
-          cargo +$NIGHTLY_TOOLCHAIN build --profile ci -p vortex-ffi
+          BASE="${{ github.event.pull_request.base.sha || 'HEAD^' }}"
+          cargo run --profile ci -p xtask -- check-editions --base "$BASE"
+      - name: "regenerate FFI header and test the C API"
+        env:
+          # Nightly regenerates cinclude/vortex.h with cbindgen during the build.
+          RUSTUP_TOOLCHAIN: ${{ env.NIGHTLY_TOOLCHAIN }}
+        run: |
+          cmake -S vortex-ffi -B "${RUNNER_TEMP}/ffi-c-build" \
+            -DCMAKE_LINKER_TYPE=MOLD \
+            -DBUILD_SHARED_LIBS=ON \
+            -DVORTEX_CARGO_PROFILE=ci \
+            -DVORTEX_BUILD_TESTS=ON
+          cmake --build "${RUNNER_TEMP}/ffi-c-build" --parallel "$(nproc)"
+          ctest --test-dir "${RUNNER_TEMP}/ffi-c-build" --parallel "$(nproc)" --output-on-failure
       - name: "Make sure no files changed after regenerating"
         run: |
           git status --porcelain
           test -z "$(git status --porcelain)"
 
-      - name: "Checkout develop flatbuffers"
-        working-directory: vortex-flatbuffers/
+      # Schemas live under `<crate>/flatbuffers/` but resolve includes against those dirs
+      # collectively, so flatten each revision into one tree for flatc to compare.
+      - name: "Collect flatbuffer schemas from this revision and from develop"
         run: |
-          cp -R flatbuffers flatbuffers.HEAD
           git fetch origin develop --depth 1
-          git checkout origin/develop -- flatbuffers
+          collect() {
+            git ls-tree -r --name-only "$1" \
+              | grep -E '(^|/)flatbuffers/.*\.fbs$' \
+              | while read -r path; do
+                  rel="${path#*/flatbuffers/}"
+                  mkdir -p "$2/$(dirname "$rel")"
+                  git show "$1:$path" > "$2/$rel"
+                done
+          }
+          collect HEAD "$RUNNER_TEMP/fbs.head"
+          collect origin/develop "$RUNNER_TEMP/fbs.develop"
       - name: "Verify flatbuffer back-compat"
-        working-directory: vortex-flatbuffers/
+        working-directory: ${{ runner.temp }}
         run: |
-          find flatbuffers/ -type f -name "*.fbs" | sed 's/^flatbuffers\///' | xargs -I{} -n1 flatc -I flatbuffers.HEAD --conform-includes flatbuffers --conform flatbuffers/{} flatbuffers.HEAD/{}
-
-  ffi-c-test:
-    name: "C API test build"
-    timeout-minutes: 10
-    runs-on: >-
-      ${{ github.repository == 'vortex-data/vortex'
-          && format('runs-on={0}/runner=amd64-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=cxx-build', github.run_id)
-          || 'ubuntu-latest' }}
-    steps:
-      - uses: runs-on/action@v2
-        if: github.repository == 'vortex-data/vortex'
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-      - uses: ./.github/actions/setup-prebuild
-        with:
-          enable-sccache: "true"
-      - name: "regenerate FFI header file"
-        run: |
-          cargo +$NIGHTLY_TOOLCHAIN build --profile ci -p vortex-ffi
-      - name: Build and run C++ unit tests
-        run: |
-          cd vortex-ffi
-          mkdir build
-          cmake -Bbuild -DRUST_BUILD_PROFILE=ci
-          cmake --build build -j $(nproc)
-          ctest --test-dir build -j $(nproc)
+          find fbs.develop/ -type f -name "*.fbs" | sed 's|^fbs.develop/||' \
+            | xargs -I{} -n1 flatc -I fbs.head --conform-includes fbs.develop --conform fbs.develop/{} fbs.head/{}

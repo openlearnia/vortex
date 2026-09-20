@@ -81,7 +81,11 @@ where
 
     // The builder's offset type matches the Arrow target, so `varbin_to_byte_array` hands the
     // offsets buffer straight to Arrow without a cast.
-    let mut builder = VarBinBuilder::<T::Offset>::with_capacity(array.dtype().clone(), array.len());
+    let mut builder = VarBinBuilder::<T::Offset>::with_capacity_in(
+        array.dtype().clone(),
+        array.len(),
+        ctx.allocator(),
+    );
     array.append_to_builder(&mut builder, ctx)?;
     varbin_to_byte_array::<T>(builder.finish_into_varbin().as_view(), validate_utf8, ctx)
 }
@@ -196,10 +200,8 @@ mod tests {
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::VarBinArray;
     use vortex_array::arrays::VarBinViewArray;
-    use vortex_array::arrays::scalar_fn::ScalarFnFactoryExt;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::Nullability;
-    use vortex_array::scalar_fn::EmptyOptions;
     use vortex_array::scalar_fn::fns::mask::Mask as MaskFn;
     use vortex_array::validity::Validity;
     use vortex_buffer::ByteBuffer;
@@ -219,8 +221,7 @@ mod tests {
             DType::Utf8(Nullability::NonNullable),
         );
         let mask = BoolArray::from_iter([true, false, true]);
-        let masked =
-            MaskFn.try_new_array(3, EmptyOptions, [varbin.into_array(), mask.into_array()])?;
+        let masked = MaskFn::try_new(varbin.into_array(), mask.into_array())?.into_array();
 
         let field = Field::new("s", DataType::Utf8, true);
         let arrow = session

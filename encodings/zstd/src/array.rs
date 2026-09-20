@@ -289,14 +289,15 @@ impl VTable for Zstd {
         {
             return result;
         }
-        // The two arms here are every builder a `Utf8`/`Binary` dtype has: all four
-        // `VarBinBuilder` widths above, and `VarBinViewBuilder` below. There is deliberately no
-        // canonicalize-then-append fallback — it would decompress to a `VarBinView` only for
-        // `VarBinView::append_to_builder` to reject the same remainder.
-        let Some(builder) = builder.as_any_mut().downcast_mut::<VarBinViewBuilder>() else {
-            vortex_bail!("append_to_builder for Zstd requires a variable-binary builder")
-        };
-        append_to_varbinview(array, builder, ctx)
+        if let Some(builder) = builder.as_any_mut().downcast_mut::<VarBinViewBuilder>() {
+            return append_to_varbinview(array, builder, ctx);
+        }
+        array
+            .array()
+            .clone()
+            .execute::<Canonical>(ctx)?
+            .into_array()
+            .append_to_builder(builder, ctx)
     }
 
     fn reduce_parent(
@@ -1144,7 +1145,7 @@ impl ZstdData {
 
         let value_bytes = values.buffer_handle().try_to_host_sync()?;
         // Align frames to buffer alignment. This is necessary for overaligned buffers.
-        let alignment = *value_bytes.alignment();
+        let alignment = value_bytes.alignment().as_usize();
         let step_width = (values_per_frame * byte_width).div_ceil(alignment) * alignment;
 
         let frame_byte_starts = (0..n_values * byte_width)
@@ -1588,6 +1589,8 @@ impl ValidityVTable<Zstd> for Zstd {
 }
 
 impl OperationsVTable<Zstd> for Zstd {
+    type ProbeState = ();
+
     fn scalar_at(
         array: ArrayView<'_, Zstd>,
         index: usize,
@@ -1770,7 +1773,10 @@ mod tests {
     #[test]
     fn test_append_to_varbin_copies_the_stored_values() -> VortexResult<()> {
         let slice = decompressed_slice(make_interleaved(&[b"hello", b"world"]), 0, 2, 0, 2);
-        let mut builder = VarBinBuilder::<i32>::new(DType::Utf8(NonNullable));
+        let mut builder = VarBinBuilder::<i32>::new_in(
+            DType::Utf8(NonNullable),
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
         append_slice_to_varbin(&slice, &Mask::new_true(2), &mut builder)?;
 
         let appended = builder.finish_into_varbin();
@@ -1790,7 +1796,10 @@ mod tests {
         buffer.extend_from_slice(&1u32.to_le_bytes());
 
         let slice = decompressed_slice(ByteBuffer::copy_from(buffer.as_slice()), 0, 2, 0, 2);
-        let mut builder = VarBinBuilder::<i32>::new(DType::Utf8(NonNullable));
+        let mut builder = VarBinBuilder::<i32>::new_in(
+            DType::Utf8(NonNullable),
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
         assert!(append_slice_to_varbin(&slice, &Mask::new_true(2), &mut builder).is_err());
         // The builder rejected the values before committing any of them.
         assert_eq!(builder.finish_into_varbin().len(), 0);

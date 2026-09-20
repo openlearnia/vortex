@@ -4,7 +4,9 @@
 #include "data.hpp"
 #include "error.hpp"
 #include "table_function.hpp"
+// DuckLake MultiFileFunction-based scan adapter (vortex_multi_file_scan).
 #include "multi_file_function.hpp"
+#include "multi_file_reader.hpp"
 #include "expr.h"
 #include "vortex_duckdb.h"
 #include "table_function.h"
@@ -12,30 +14,21 @@
 
 #include "duckdb.h"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/default/default_functions.hpp"
 #include "duckdb/common/insertion_order_preserving_map.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/capi/capi_internal.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/function/partition_stats.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/storage/storage_index.hpp"
 
 using namespace std::string_literals;
 constexpr column_t COLUMN_IDENTIFIER_FILE_INDEX = MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX;
 constexpr column_t COLUMN_IDENTIFIER_FILE_ROW_NUMBER = MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER;
-
-unique_ptr<FunctionData> VortexBindData::Copy() const {
-    const auto copied_ffi_data = duckdb_table_function_bind_data_clone(ffi_data->DataPtr());
-    auto ffi_data_p = unique_ptr<CData>(reinterpret_cast<CData *>(copied_ffi_data));
-    return make_uniq<VortexBindData>(std::move(ffi_data_p), types);
-}
-
-bool VortexBindData::Equals(const FunctionData &other_base) const {
-    const VortexBindData &other = other_base.Cast<VortexBindData>();
-    // if "types" are different, "ffi_data" would also be different as it
-    // contains types inside, so omit "types" from comparison.
-    return ffi_data.get() == other.ffi_data.get();
-}
 
 // This is a flaw of Duckdb API which doesn't allow passing non-const
 // expressions. We never modify the value on Rust side.
@@ -44,112 +37,7 @@ static duckdb_vx_expr get_ffi_expr(const Expression &expr) {
 }
 
 static void *get_ffi_bind(const FunctionData *bind_data) {
-    return bind_data->Cast<VortexBindData>().ffi_data->DataPtr();
-}
-
-static void *get_ffi_global(GlobalTableFunctionState *state) {
-    return state->Cast<VortexGlobalData>().ffi_data->DataPtr();
-}
-
-static void *get_ffi_local(LocalTableFunctionState *state) {
-    return state->Cast<VortexLocalData>().ffi_data->DataPtr();
-}
-
-double
-table_scan_progress(ClientContext &, const FunctionData *, const GlobalTableFunctionState *global_state) {
-    void *const c_global_state = global_state->Cast<VortexGlobalData>().ffi_data->DataPtr();
-    return duckdb_table_function_scan_progress(c_global_state);
-}
-
-static Value &UnwrapValue(duckdb_value value) {
-    return *(reinterpret_cast<Value *>(value));
-}
-
-unique_ptr<BaseStatistics> numeric_stats(duckdb_column_statistics &stats, LogicalType type) {
-    BaseStatistics out = StringStats::CreateUnknown(type);
-    if (stats.min) {
-        NumericStats::SetMin(out, UnwrapValue(stats.min));
-        duckdb_destroy_value(&stats.min);
-    }
-    if (stats.max) {
-        NumericStats::SetMax(out, UnwrapValue(stats.max));
-        duckdb_destroy_value(&stats.max);
-    }
-    if (!stats.has_null) {
-        out.Set(StatsInfo::CANNOT_HAVE_NULL_VALUES);
-    }
-    return out.ToUnique();
-}
-
-unique_ptr<BaseStatistics> string_stats(duckdb_column_statistics &stats, LogicalType type) {
-    BaseStatistics out = StringStats::CreateUnknown(type);
-    if (stats.min) {
-        StringStats::SetMin(out, StringValue::Get(UnwrapValue(stats.min)));
-        duckdb_destroy_value(&stats.min);
-    }
-    if (stats.max) {
-        StringStats::SetMax(out, StringValue::Get(UnwrapValue(stats.max)));
-        duckdb_destroy_value(&stats.max);
-    }
-    if (stats.max_string_length >> 63) {
-        StringStats::SetMaxStringLength(out, uint32_t(stats.max_string_length));
-    }
-    if (!stats.has_null) {
-        out.Set(StatsInfo::CANNOT_HAVE_NULL_VALUES);
-    }
-
-    return out.ToUnique();
-}
-
-unique_ptr<BaseStatistics> base_stats(duckdb_column_statistics &stats, LogicalType type) {
-    BaseStatistics out = StringStats::CreateUnknown(type);
-    if (!stats.has_null) {
-        out.Set(StatsInfo::CANNOT_HAVE_NULL_VALUES);
-    }
-    return out.ToUnique();
-}
-
-unique_ptr<BaseStatistics> vortex_table_statistics(ClientContext &, const FunctionData *bind_data,
-                                                   column_t column_index) {
-    if (IsVirtualColumn(column_index)) {
-        return {};
-    }
-
-    const auto &bind = bind_data->Cast<VortexBindData>();
-    const void *const ffi_bind = get_ffi_bind(bind_data);
-    const LogicalType type = bind.types[column_index];
-    if (type.IsNested() || type.id() == LogicalTypeId::VARIANT) {
-        return {};
-    }
-
-    duckdb_column_statistics statistics = {};
-    if (!duckdb_table_function_statistics(ffi_bind, column_index, &statistics)) {
-        return {};
-    }
-
-    switch (type.id()) {
-    case LogicalTypeId::BOOLEAN:
-    case LogicalTypeId::TINYINT:
-    case LogicalTypeId::SMALLINT:
-    case LogicalTypeId::INTEGER:
-    case LogicalTypeId::BIGINT:
-    case LogicalTypeId::FLOAT:
-    case LogicalTypeId::DOUBLE:
-    case LogicalTypeId::UTINYINT:
-    case LogicalTypeId::USMALLINT:
-    case LogicalTypeId::UINTEGER:
-    case LogicalTypeId::UBIGINT:
-    case LogicalTypeId::UHUGEINT:
-    case LogicalTypeId::HUGEINT: {
-        return numeric_stats(statistics, type);
-    }
-    case LogicalTypeId::VARCHAR:
-    case LogicalTypeId::BLOB: {
-        return string_stats(statistics, type);
-    }
-    default:
-        return base_stats(statistics, type);
-    }
+    return bind_data->Cast<MultiFileBindData>().bind_data->Cast<VortexBindData>().ffi_bind_data->DataPtr();
 }
 
 bool projection_expression_pushdown(ClientContext &, const TableFunctionProjectionExpressionInput &input) {
@@ -194,74 +82,6 @@ bool aggregate_pushdown(ClientContext &, const TableFunctionUngroupedAggregateIn
     return res;
 }
 
-unique_ptr<FunctionData> duckdb_vx_table_function_bind(ClientContext &,
-                                                       TableFunctionBindInput &input,
-                                                       vector<LogicalType> &return_types,
-                                                       vector<string> &names) {
-    VortexBindResults result = {return_types, names};
-
-    duckdb_vx_error error_out = nullptr;
-    duckdb_vx_tfunc_bind_input bind_input = reinterpret_cast<duckdb_vx_tfunc_bind_input>(&input);
-    duckdb_vx_tfunc_bind_result bind_result = reinterpret_cast<duckdb_vx_tfunc_bind_result>(&result);
-    duckdb_vx_data ffi_bind_data = duckdb_table_function_bind(bind_input, bind_result, &error_out);
-    if (error_out) {
-        throw BinderException(IntoErrString(error_out));
-    }
-
-    auto cdata = unique_ptr<CData>(reinterpret_cast<CData *>(ffi_bind_data));
-    return make_uniq<VortexBindData>(std::move(cdata), return_types);
-}
-
-unique_ptr<GlobalTableFunctionState> vortex_table_init_global(ClientContext &context, TableFunctionInitInput &input) {
-    const void *const ffi_bind = get_ffi_bind(input.bind_data.get());
-
-    duckdb_vx_tfunc_init_input ffi_input = {
-        .bind_data = ffi_bind,
-        .column_ids = input.column_ids.data(),
-        .column_ids_count = input.column_ids.size(),
-        .projection_ids = input.projection_ids.data(),
-        .projection_ids_count = input.projection_ids.size(),
-        .filters = reinterpret_cast<duckdb_vx_table_filter_set>(input.filters.get()),
-        .client_context = reinterpret_cast<duckdb_client_context>(&context),
-    };
-
-    duckdb_vx_error error_out = nullptr;
-    duckdb_vx_data ffi_global_data = duckdb_table_function_init_global(&ffi_input, &error_out);
-    if (error_out) {
-        throw BinderException(IntoErrString(error_out));
-    }
-
-    auto cdata = unique_ptr<CData>(reinterpret_cast<CData *>(ffi_global_data));
-    return make_uniq<VortexGlobalData>(std::move(cdata));
-}
-
-unique_ptr<LocalTableFunctionState> vortex_table_init_local(TableFunctionInitInput &input,
-                                                            GlobalTableFunctionState *global_state) {
-    const void *const ffi_bind = get_ffi_bind(input.bind_data.get());
-    void *const ffi_global = get_ffi_global(global_state);
-
-    duckdb_vx_data ffi_local_data = duckdb_table_function_init_local(ffi_bind, ffi_global);
-    auto cdata = unique_ptr<CData>(reinterpret_cast<CData *>(ffi_local_data));
-    return make_uniq<VortexLocalData>(std::move(cdata));
-}
-
-static unique_ptr<LocalTableFunctionState> init_local(ExecutionContext &, TableFunctionInitInput &input,
-                                                      GlobalTableFunctionState *global_state) {
-    return vortex_table_init_local(input, global_state);
-}
-
-void vortex_table_scan(ClientContext &, TableFunctionInput &input, DataChunk &output) {
-    void *const ffi_global = get_ffi_global(input.global_state.get());
-    void *const ffi_local = get_ffi_local(input.local_state.get());
-
-    duckdb_data_chunk chunk = reinterpret_cast<duckdb_data_chunk>(&output);
-    duckdb_vx_error error_out = nullptr;
-    duckdb_table_function_scan(ffi_global, ffi_local, chunk, &error_out);
-    if (error_out) {
-        throw InvalidInputException(IntoErrString(error_out));
-    }
-}
-
 using FilterVec = vector<unique_ptr<Expression>>;
 
 void pushdown_complex_filter(const FunctionData &bind_data, FilterVec &filters) {
@@ -279,81 +99,18 @@ void pushdown_complex_filter(const FunctionData &bind_data, FilterVec &filters) 
     }
 }
 
-unique_ptr<NodeStatistics> cardinality(ClientContext &, const FunctionData *bind_data) {
-    const void *const ffi_bind = get_ffi_bind(bind_data);
-
-    duckdb_vx_node_statistics stats = {};
-    duckdb_table_function_cardinality(ffi_bind, &stats);
-
-    auto out = make_uniq<NodeStatistics>();
-    out->has_estimated_cardinality = stats.has_estimated_cardinality;
-    out->estimated_cardinality = stats.estimated_cardinality;
-    out->has_max_cardinality = stats.has_max_cardinality;
-    out->max_cardinality = stats.max_cardinality;
-
-    return out;
-}
-
-extern "C" duckdb_value duckdb_vx_tfunc_bind_input_get_parameter(duckdb_vx_tfunc_bind_input ffi_input,
-                                                                 size_t index) {
-    D_ASSERT(ffi_input);
-    const TableFunctionBindInput &input = *reinterpret_cast<TableFunctionBindInput *>(ffi_input);
-    if (index >= input.inputs.size()) {
-        return nullptr;
-    }
-    return reinterpret_cast<duckdb_value>(new Value(input.inputs[index]));
-}
-
-extern "C" void duckdb_vx_tfunc_bind_result_add_column(duckdb_vx_tfunc_bind_result ffi_result,
+extern "C" void duckdb_vx_tfunc_bind_result_add_column(duckdb_bind_result ffi_result,
                                                        const char *name_str,
                                                        size_t name_len,
                                                        duckdb_logical_type ffi_type) {
     D_ASSERT(ffi_result);
     D_ASSERT(name_str);
     D_ASSERT(ffi_type);
-    const VortexBindResults &result = *reinterpret_cast<VortexBindResults *>(ffi_result);
+    VortexBindResult &result = *reinterpret_cast<VortexBindResult *>(ffi_result);
     const LogicalType logical_type = *reinterpret_cast<LogicalType *>(ffi_type);
 
     result.names.emplace_back(name_str, name_len);
     result.return_types.emplace_back(logical_type);
-}
-
-/**
- * Called at planning time to determine whether data is partitioned by a
- * given set of columns. Requested columns are GROUP BY parameters i.e. columns
- * over which the query aggregates.
- */
-TablePartitionInfo get_partition_info(ClientContext &, TableFunctionPartitionInput &input) {
-    const vector<column_t> &ids = input.partition_ids;
-    // Our data is partitioned by array exporters. Each exporter processes a
-    // single Array which belongs to a single file. If data is partitioned only
-    // by file_index, there is one unique value for an Array. Otherwise there
-    // may be multiple values.
-    return (ids.size() == 1 && ids[0] == COLUMN_IDENTIFIER_FILE_INDEX)
-               ? TablePartitionInfo::SINGLE_VALUE_PARTITIONS
-               : TablePartitionInfo::NOT_PARTITIONED;
-}
-
-OperatorPartitionData get_partition_data(ClientContext &, TableFunctionGetPartitionInput &input) {
-    void *const ffi_global = get_ffi_global(input.global_state.get());
-    void *const ffi_local = get_ffi_local(input.local_state.get());
-    duckdb_vx_partition_data partition_data;
-    duckdb_table_function_get_partition_data(ffi_global, ffi_local, &partition_data);
-
-    OperatorPartitionData out(partition_data.partition_index);
-
-    // file_index_column_pos may be INVALID_IDX, but column_index will never
-    // be INVALID_IDX, so we can compare directly
-    for (const column_t column_index : input.partition_info.partition_columns) {
-        if (column_index == partition_data.file_index_column_pos) {
-            out.partition_data.emplace_back(Value::UBIGINT(partition_data.file_index));
-        } else {
-            throw InternalException(StringUtil::Format(
-                "get_partition_data: requested column_index %d is not constant for given partition",
-                column_index));
-        }
-    }
-    return out;
 }
 
 extern "C" void duckdb_vx_string_map_insert(duckdb_vx_string_map map, const char *key, const char *value) {
@@ -371,57 +128,150 @@ InsertionOrderPreservingMap<string> to_string(TableFunctionToStringInput &input)
     return result;
 }
 
+bool is_vortex_scan(const TableFunction &function) {
+    return function.bind == MultiFileFunction<VortexReaderInterface>::MultiFileBind;
+}
+
+unique_ptr<MultiFileReader> get_multi_file_reader(const TableFunction &) {
+    return make_uniq<VortexMultiFileReader>();
+}
+
+unique_ptr<BaseStatistics> VortexRowGroup::GetColumnStatistics(const StorageIndex &storage_index) {
+    duckdb_column_statistics statistics = {};
+    const idx_t idx = storage_index.GetPrimaryIndex();
+    const void *const ffi_footer_ptr = ffi_footer->DataPtr();
+    if (!duckdb_footer_get_statistics(ffi_footer_ptr, idx, &statistics)) {
+        return {};
+    }
+    return to_duckdb_statistics(statistics);
+}
+
+static vector<PartitionStatistics> get_partition_stats(ClientContext &, GetPartitionStatsInput &input) {
+    const MultiFileBindData &bind_data = input.bind_data->Cast<MultiFileBindData>();
+    VortexBindData &bind = bind_data.bind_data->Cast<VortexBindData>();
+    void *const ffi_bind = bind.ffi_bind_data->DataPtr();
+
+    if (!duckdb_table_function_can_get_partition_stats(ffi_bind)) {
+        return {};
+    }
+
+    vector<OpenFileInfo> files = bind_data.file_list->GetAllFiles();
+    vector<PartitionStatistics> result(files.size());
+    idx_t row_start = 0;
+    uint64_t count = 0;
+    duckdb_vx_error error = nullptr;
+    for (size_t i = 0; i < files.size(); ++i) {
+        const std::string_view path = files[i].path;
+        duckdb_vx_data raw = duckdb_footer_get_cached(ffi_bind, path.data(), path.size(), &count, &error);
+        unique_ptr<CData> cdata(reinterpret_cast<CData *>(raw));
+        if (error) {
+            throw BinderException(IntoErrString(error));
+        }
+        if (!cdata) {
+            return {};
+        }
+
+        PartitionStatistics &stats = result[i];
+        stats.row_start = row_start;
+        stats.count = count;
+        stats.count_type = CountType::COUNT_EXACT;
+        row_start += count;
+        stats.partition_row_group = make_shared_ptr<VortexRowGroup>(std::move(cdata));
+    }
+    return result;
+}
+
 duckdb_state register_table_function(DatabaseInstance &db, LogicalType parameter, const std::string &name) {
-    TableFunction tf(name, {}, vortex_table_scan, duckdb_vx_table_function_bind, vortex_table_init_global, init_local);
+    MultiFileFunction<VortexReaderInterface> fn(name);
+    fn.arguments[0] = parameter;
+    fn.named_parameters = {{"filename", LogicalType::ANY},
+                           {"allow_empty", LogicalType::BOOLEAN},
+                           {"hive_partitioning", LogicalType::BOOLEAN}};
 
-    tf.projection_pushdown = true;
-    tf.filter_pushdown = true;
-    tf.filter_prune = true;
-    tf.sampling_pushdown = false;
+    fn.filter_pushdown = true;
+    fn.filter_prune = true;
+    // Pushed-down filters, projections and aggregates live in the FFI bind data, which has no
+    // serializer. DuckDB's common-subplan optimizer keys scans on their serialized form, so
+    // without this two scans of the same file with different pushed-down filters look identical
+    // and are merged into one shared CTE, returning the wrong rows for one of them.
+    fn.verify_serialization = false;
 
-    tf.pushdown_expression = [](auto &, const auto &, Expression &expression) {
+    fn.pushdown_expression = [](auto &, const auto &, Expression &expression) {
         return duckdb_table_function_pushdown_expression(reinterpret_cast<duckdb_vx_expr>(&expression));
     };
-    tf.pushdown_complex_filter = [](auto &, auto &, FunctionData *bind_data, FilterVec &filters) {
+    fn.pushdown_complex_filter = [](auto &, auto &, FunctionData *bind_data, FilterVec &filters) {
         pushdown_complex_filter(*bind_data, filters);
     };
-    tf.cardinality = cardinality;
-    tf.get_partition_info = get_partition_info;
-    tf.get_partition_data = get_partition_data;
-    tf.to_string = to_string;
-    tf.table_scan_progress = table_scan_progress;
-    tf.statistics = vortex_table_statistics;
+    fn.to_string = to_string;
 
-    tf.late_materialization = true;
+    fn.late_materialization = true;
     // Columns that uniquely identify a row for deferred re-fetch in a multi
     // file scan: (file index, row number in file).
-    tf.get_row_id_columns = [](auto &, auto) -> vector<column_t> {
+    fn.get_row_id_columns = [](auto &, auto) -> vector<column_t> {
         return {COLUMN_IDENTIFIER_FILE_INDEX, COLUMN_IDENTIFIER_FILE_ROW_NUMBER};
     };
 
-    tf.get_virtual_columns = [](auto &, auto) -> virtual_column_map_t {
-        return {
-            {COLUMN_IDENTIFIER_EMPTY, {"", LogicalTypeId::BOOLEAN}},
-            {COLUMN_IDENTIFIER_FILE_INDEX, {"file_index", LogicalType::UBIGINT}},
-            // MultiFileReader's file_row_number column is BIGINT.
-            // row_idx() is UBIGINT. Use UBIGINT since there's no difference to
-            // Duckdb what to compare.
-            {COLUMN_IDENTIFIER_FILE_ROW_NUMBER, {"file_row_number", LogicalType::UBIGINT}},
-        };
-    };
+    fn.statistics = MultiFileFunction<VortexReaderInterface>::MultiFileScanStats;
+    fn.get_partition_stats = get_partition_stats;
+    fn.get_multi_file_reader = get_multi_file_reader;
 
-    tf.arguments.resize(1);
-    tf.arguments[0] = parameter;
+    /**
+     * duckdb's serialization is broken. If you don't set serialize/deserialize
+     * callbacks, duckdb serializes only the internal state which doesn't work
+     * for Vortex if you have filters pushed down. Worse, duckdb uses this
+     * information for CommonSubplanOptimizer which then merges different
+     * Vortex scans (with different filters pushed down) into one scan in tpcds.
+     *
+     * However, this is a regression on q15 and such where we do have
+     * completely equal scans which can't be merged. This is a reasonable price
+     * for correctness.
+     *
+     * Very unexpectedly verify_serialization doesn't do any verification but
+     * disables serialization at all.
+     */
+    fn.verify_serialization = false;
+    fn.serialize = [](auto &, auto, auto &) {
+        throw NotImplementedException("Can't serialize Vortex state");
+    };
+    fn.deserialize = [](auto &, auto &) -> unique_ptr<FunctionData> {
+        throw NotImplementedException("Can't deserialize Vortex state");
+    };
 
     try {
         auto &system_catalog = Catalog::GetSystemCatalog(db);
         auto data = CatalogTransaction::GetSystemTransaction(db);
-        CreateTableFunctionInfo tf_info(tf);
+        CreateTableFunctionInfo tf_info(fn);
         tf_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
         system_catalog.CreateFunction(data, tf_info);
     } catch (const std::exception &e) {
         ErrorData data(e);
         DUCKDB_LOG_ERROR(db, "Failed to create Vortex table function:\t" + data.Message());
+        return DuckDBError;
+    }
+    return DuckDBSuccess;
+}
+
+extern "C" duckdb_state duckdb_vx_register_version_function(duckdb_database ffi_db, const char *version) {
+    D_ASSERT(ffi_db);
+    D_ASSERT(version);
+    const DatabaseWrapper &wrapper = *reinterpret_cast<DatabaseWrapper *>(ffi_db);
+    DatabaseInstance &db = *wrapper.database->instance;
+
+    const string quoted = KeywordHelper::WriteQuoted(version);
+
+    const DefaultMacro macro {DEFAULT_SCHEMA,
+                              "vortex_version",
+                              {nullptr},
+                              {{nullptr, nullptr}},
+                              quoted.c_str()};
+    try {
+        auto info = DefaultFunctionGenerator::CreateInternalMacroInfo(macro);
+        auto &system_catalog = Catalog::GetSystemCatalog(db);
+        auto data = CatalogTransaction::GetSystemTransaction(db);
+        system_catalog.CreateFunction(data, *info);
+    } catch (const std::exception &e) {
+        ErrorData data(e);
+        DUCKDB_LOG_ERROR(db, "Failed to create the vortex_version macro:\t" + data.Message());
         return DuckDBError;
     }
     return DuckDBSuccess;

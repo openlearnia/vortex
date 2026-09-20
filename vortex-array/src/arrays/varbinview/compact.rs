@@ -65,6 +65,7 @@ impl VarBinViewArray {
 
     /// Iterates over all valid, non-inlined views, calling the provided
     /// closure for each one.
+    #[allow(clippy::inline_always)]
     #[inline(always)]
     fn iter_valid_views<F>(&self, ctx: &mut ExecutionCtx, mut f: F) -> VortexResult<()>
     where
@@ -141,10 +142,11 @@ impl VarBinViewArray {
         buffer_utilization_threshold: f64, // [0, 1]
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<VarBinViewArray> {
-        let mut builder = VarBinViewBuilder::with_compaction(
+        let mut builder = VarBinViewBuilder::with_compaction_in(
             self.dtype().clone(),
             self.len(),
             buffer_utilization_threshold,
+            ctx.allocator().clone(),
         );
         builder.append_varbinview_array(self, ctx)?;
         Ok(builder.finish_into_varbinview())

@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::cmp::Ordering;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_fs::OpenOptions;
@@ -15,17 +13,6 @@ use object_store::registry::ObjectStoreRegistry;
 use parking_lot::Mutex;
 use static_assertions::assert_impl_all;
 use vortex::array::ArrayRef;
-use vortex::array::ExecutionCtx;
-use vortex::array::VortexSessionExecute;
-use vortex::array::arrays::FixedSizeListArray;
-use vortex::array::arrays::ListViewArray;
-use vortex::array::arrays::MapArray;
-use vortex::array::arrays::StructArray;
-use vortex::array::arrays::fixed_size_list::FixedSizeListArrayExt;
-use vortex::array::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
-use vortex::array::arrays::listview::ListViewArraySlotsExt;
-use vortex::array::arrays::map::MapArraySlotsExt;
-use vortex::array::arrays::struct_::StructArrayExt;
 use vortex::array::stream::ArrayStreamAdapter;
 use vortex::buffer::ByteBuffer;
 use vortex::dtype::DType;
@@ -37,8 +24,11 @@ use vortex::editions::ComponentKind;
 use vortex::editions::EditionSessionExt;
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
+use vortex::error::vortex_bail;
 use vortex::error::vortex_err;
 use vortex::file::OpenOptionsSessionExt;
+use vortex::expr::stats::Precision;
+use vortex::expr::stats::Stat;
 use vortex::file::WriteOptionsSessionExt;
 use vortex::file::WriteStrategyBuilder;
 use vortex::file::WriteSummary;
@@ -48,7 +38,6 @@ use vortex::io::compat::Compat;
 use vortex::io::object_store::ObjectStoreWrite;
 use vortex::io::runtime::BlockingRuntime;
 use vortex::io::runtime::Task;
-use vortex::io::runtime::current::CurrentThreadWorkerPool;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::scalar::Scalar;
 use vortex::scalar::ScalarValue;
@@ -64,22 +53,7 @@ use crate::convert::ToDuckDBScalar;
 use crate::convert::data_chunk_to_vortex;
 use crate::duckdb::DataChunkRef;
 use crate::duckdb::LogicalTypeRef;
-
-/// DuckLake-shaped per-column stats collected at finalize time.
-#[derive(Debug, Clone)]
-pub struct ExportedColumnStatistics {
-    pub name: String,
-    pub null_count: Option<u64>,
-    pub num_values: Option<u64>,
-    pub column_size_bytes: Option<u64>,
-    pub min: Option<String>,
-    pub max: Option<String>,
-    pub has_nan: Option<bool>,
-}
-
-fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
+use crate::duckdb::Value;
 
 fn copy_write_options() -> vortex::file::VortexWriteOptions {
     let strategy = WriteStrategyBuilder::default()
@@ -92,15 +66,6 @@ fn copy_write_options() -> vortex::file::VortexWriteOptions {
         .for_ingest()
         .build();
     SESSION.write_options().with_strategy(strategy)
-}
-
-fn join_stats_path(prefix: &str, name: &str) -> String {
-    let seg = quote_ident(name);
-    if prefix.is_empty() {
-        seg
-    } else {
-        format!("{prefix}.{seg}")
-    }
 }
 
 fn uuid_stats_string(value: &ScalarValue) -> Option<String> {
@@ -157,298 +122,19 @@ pub(crate) fn scalar_value_to_stats_string(dtype: &DType, value: ScalarValue) ->
     Some(duck.to_string())
 }
 
-#[derive(Default)]
-struct LeafAcc {
-    dtype: Option<DType>,
-    null_count: u64,
-    num_values: u64,
-    min: Option<Scalar>,
-    max: Option<Scalar>,
-    has_nan: Option<bool>,
-}
-
-impl LeafAcc {
-    fn merge_leaf(&mut self, array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<()> {
-        use vortex::expr::stats::Stat;
-
-        self.dtype.get_or_insert_with(|| array.dtype().clone());
-        self.num_values += array.len() as u64;
-
-        // ponytail: UUID stats scan each scalar until the extension gains Min/Max kernels.
-        if is_uuid_ext(array.dtype()) {
-            for i in 0..array.len() {
-                let s = array.execute_scalar(i, ctx)?;
-                if s.is_null() {
-                    self.null_count += 1;
-                    continue;
-                }
-                match &self.min {
-                    None => self.min = Some(s.clone()),
-                    Some(cur) if s.partial_cmp(cur) == Some(Ordering::Less) => {
-                        self.min = Some(s.clone())
-                    }
-                    _ => {}
-                }
-                match &self.max {
-                    None => self.max = Some(s.clone()),
-                    Some(cur) if s.partial_cmp(cur) == Some(Ordering::Greater) => {
-                        self.max = Some(s.clone())
-                    }
-                    _ => {}
-                }
-            }
-            return Ok(());
-        }
-
-        if let Some(v) = array.statistics().compute_stat(Stat::NullCount, ctx)? {
-            if let Some(n) = v.as_primitive().as_::<u64>() {
-                self.null_count += n;
-            }
-        }
-        if let Some(s) = array.statistics().compute_stat(Stat::Min, ctx)? {
-            match &self.min {
-                None => self.min = Some(s),
-                Some(cur) if s.partial_cmp(cur) == Some(Ordering::Less) => self.min = Some(s),
-                _ => {}
-            }
-        }
-        if let Some(s) = array.statistics().compute_stat(Stat::Max, ctx)? {
-            match &self.max {
-                None => self.max = Some(s),
-                Some(cur) if s.partial_cmp(cur) == Some(Ordering::Greater) => self.max = Some(s),
-                _ => {}
-            }
-        }
-        if let Some(v) = array.statistics().compute_stat(Stat::NaNCount, ctx)? {
-            if let Some(n) = v.as_primitive().as_::<u64>() {
-                self.has_nan = Some(self.has_nan.unwrap_or(false) || n > 0);
-            }
-        }
-        Ok(())
-    }
-
-    fn into_exported(self, name: String) -> Option<ExportedColumnStatistics> {
-        let dtype = self.dtype?;
-        let min = self.min.as_ref().and_then(|s| {
-            s.value()
-                .cloned()
-                .and_then(|v| scalar_value_to_stats_string(&dtype, v))
-        });
-        let max = self.max.as_ref().and_then(|s| {
-            s.value()
-                .cloned()
-                .and_then(|v| scalar_value_to_stats_string(&dtype, v))
-        });
-        Some(ExportedColumnStatistics {
-            name,
-            null_count: Some(self.null_count),
-            num_values: Some(self.num_values),
-            column_size_bytes: None,
-            min,
-            max,
-            has_nan: self.has_nan,
-        })
-    }
-}
-
-fn is_uuid_ext(dtype: &DType) -> bool {
-    matches!(
-        dtype,
-        DType::Extension(ext) if ext.id().as_ref() == "vortex.uuid"
-    )
-}
-
-fn is_variant_ext(dtype: &DType) -> bool {
-    matches!(
-        dtype,
-        DType::Extension(ext) if ext.id().as_ref() == crate::convert::ext_types::VARIANT_EXT_ID
-    )
-}
-
-/// Recursively accumulate DuckLake-shaped nested leaf stats (`"col"."element"`, `"s"."a"`, …).
-///
-/// Vortex file footers only store top-level field stats today; DuckLake RETURN_STATS needs leaf
-/// paths matching Parquet. ponytail: ListView may retain unreferenced element slots — upgrade to a
-/// referenced-only compact when writers start leaving sparse garbage that skews min/max.
-fn accumulate_nested(
-    path: &str,
-    array: &ArrayRef,
-    out: &mut BTreeMap<String, LeafAcc>,
-    ctx: &mut ExecutionCtx,
-) -> VortexResult<()> {
-    if is_variant_ext(array.dtype()) {
-        return Ok(());
-    }
-
-    match array.dtype() {
-        DType::Struct(fields, _) => {
-            let struct_array = array.clone().execute::<StructArray>(ctx)?;
-            for (name, field) in fields
-                .names()
-                .iter()
-                .zip(struct_array.iter_unmasked_fields())
-            {
-                let child_path = join_stats_path(path, name.as_ref());
-                accumulate_nested(&child_path, field, out, ctx)?;
-            }
-            Ok(())
-        }
-        DType::List(_, _) => {
-            // DuckDB COPY always builds ListView for lists.
-            let elements = array
-                .clone()
-                .execute::<ListViewArray>(ctx)?
-                .elements()
-                .clone();
-            let child_path = join_stats_path(path, "element");
-            accumulate_nested(&child_path, &elements, out, ctx)
-        }
-        DType::FixedSizeList(_, _, _) => {
-            let fsl = array.clone().execute::<FixedSizeListArray>(ctx)?;
-            let child_path = join_stats_path(path, "element");
-            accumulate_nested(&child_path, fsl.elements(), out, ctx)
-        }
-        DType::Map(_, _) => {
-            // Parquet/DuckLake map paths are `"m"."key"` / `"m"."value"` (no list "element").
-            let map = array.clone().execute::<MapArray>(ctx)?;
-            let entries = map.entries().clone();
-            let entry_structs = entries.execute::<ListViewArray>(ctx)?.elements().clone();
-            accumulate_nested(path, &entry_structs, out, ctx)
-        }
-        _ => {
-            if path.is_empty() {
-                return Ok(());
-            }
-            out.entry(path.to_string())
-                .or_default()
-                .merge_leaf(array, ctx)
-        }
-    }
-}
-
-fn accumulate_top_level_nested(
-    array: &ArrayRef,
-    out: &mut BTreeMap<String, LeafAcc>,
-    ctx: &mut ExecutionCtx,
-) -> VortexResult<()> {
-    let DType::Struct(fields, _) = array.dtype() else {
-        return Ok(());
-    };
-    let struct_array = array.clone().execute::<StructArray>(ctx)?;
-    for (name, field) in fields
-        .names()
-        .iter()
-        .zip(struct_array.iter_unmasked_fields())
-    {
-        match field.dtype() {
-            DType::Struct(_, _)
-            | DType::List(_, _)
-            | DType::FixedSizeList(_, _, _)
-            | DType::Map(_, _) => {
-                let path = quote_ident(name.as_ref());
-                accumulate_nested(&path, field, out, ctx)?;
-            }
-            // File-footer Min/Max are not computed for UUID extension arrays; gather here.
-            dtype if is_uuid_ext(dtype) => {
-                out.entry(name.to_string())
-                    .or_default()
-                    .merge_leaf(field, ctx)?;
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-fn export_write_summary_stats(
-    summary: &WriteSummary,
-    row_count: u64,
-    nested_leaves: BTreeMap<String, LeafAcc>,
-) -> VortexResult<Vec<ExportedColumnStatistics>> {
-    let mut out = Vec::new();
-    let Some(file_stats) = summary.footer().statistics() else {
-        for (name, acc) in nested_leaves {
-            if let Some(exported) = acc.into_exported(name) {
-                out.push(exported);
-            }
-        }
-        return Ok(out);
-    };
-    let column_sizes = summary.compressed_column_sizes().unwrap_or_default();
-    let names: Vec<String> = match summary.footer().dtype() {
-        DType::Struct(fields, _) => fields.names().iter().map(|n| n.to_string()).collect(),
-        _ => vec!["value".to_string()],
-    };
-
-    for (idx, (stats, dtype)) in file_stats
-        .stats_sets()
-        .iter()
-        .zip(file_stats.dtypes().iter())
-        .enumerate()
-    {
-        use vortex::expr::stats::Precision;
-        use vortex::expr::stats::Stat;
-
-        if is_variant_ext(dtype) {
-            continue;
-        }
-        // Nested containers: leaf paths are emitted separately below.
-        // UUID: footer Min/Max unsupported; sink-accumulated leaves used instead.
-        if matches!(
-            dtype,
-            DType::Struct(_, _)
-                | DType::List(_, _)
-                | DType::FixedSizeList(_, _, _)
-                | DType::Map(_, _)
-        ) || is_uuid_ext(dtype)
-        {
-            continue;
-        }
-        let name = names
-            .get(idx)
-            .cloned()
-            .unwrap_or_else(|| format!("col_{idx}"));
-        let null_count = match stats.get(Stat::NullCount) {
-            Precision::Exact(v) => v.as_primitive().as_u64(),
-            _ => None,
-        };
-        let has_nan = match stats.get(Stat::NaNCount) {
-            Precision::Exact(v) => v.as_primitive().as_u64().map(|c| c > 0),
-            _ => None,
-        };
-        let min = match stats.get(Stat::Min) {
-            Precision::Exact(v) => scalar_value_to_stats_string(dtype, v),
-            _ => None,
-        };
-        let max = match stats.get(Stat::Max) {
-            Precision::Exact(v) => scalar_value_to_stats_string(dtype, v),
-            _ => None,
-        };
-        out.push(ExportedColumnStatistics {
-            name,
-            null_count,
-            num_values: Some(row_count),
-            column_size_bytes: column_sizes.get(idx).copied(),
-            min,
-            max,
-            has_nan,
-        });
-    }
-
-    for (name, acc) in nested_leaves {
-        if let Some(exported) = acc.into_exported(name) {
-            out.push(exported);
-        }
-    }
-    Ok(out)
-}
-
 #[derive(Clone)]
 pub struct CopyFunctionBind {
     dtype: DType,
     fields: StructFields,
 }
 assert_impl_all!(CopyFunctionBind: Send, Clone);
+
+/// The per-column compressed sizes are computed once here rather than per column, since DuckDB
+/// queries statistics one column at a time.
+struct FinishedWrite {
+    summary: WriteSummary,
+    column_sizes: Vec<u64>,
+}
 
 /// Write to a file has two phases, writing data chunks and then closing the file.
 /// We use a spawned tokio task to actually compress arrays and write it to disk.
@@ -457,17 +143,8 @@ assert_impl_all!(CopyFunctionBind: Send, Clone);
 /// flushed to disk.
 pub struct CopyFunctionGlobal {
     write_task: Mutex<Option<Task<VortexResult<WriteSummary>>>>,
+    finished: Mutex<Option<FinishedWrite>>,
     sink: Option<Sender<VortexResult<ArrayRef>>>,
-    // Pool of background workers helping to drive the write task.
-    // Note that this is optional and without it, we would only drive the task when DuckDB calls
-    // into us, and we call `RUNTIME.block_on`.
-    // TODO(myrrc): we should rely only on host threads, remove this
-    #[expect(dead_code)]
-    worker_pool: CurrentThreadWorkerPool,
-    /// Nested leaf stats accumulated during sink (Parquet-shaped dotted paths).
-    nested_leaf_stats: Mutex<BTreeMap<String, LeafAcc>>,
-    /// Populated by finalize for C++ to pull into CopyFunctionFileStatistics.
-    pub exported_stats: Vec<ExportedColumnStatistics>,
 }
 assert_impl_all!(CopyFunctionGlobal: Send, Sync);
 
@@ -492,29 +169,61 @@ pub fn copy_to_bind(
     })
 }
 
+fn push_to_writer(global: &CopyFunctionGlobal, array: ArrayRef) -> VortexResult<()> {
+    let mut sink = global
+        .sink
+        .as_ref()
+        .ok_or_else(|| vortex_err!("sink closed early"))?
+        .clone();
+    RUNTIME.block_on(async {
+        // send may error with "receiver is gone" which isn't the real error
+        if sink.send(Ok(array)).await.is_ok() {
+            return Ok(());
+        }
+        let task = global.write_task.lock().take();
+        if let Some(task) = task {
+            // we can get the real error (i.e invalid path) from here
+            task.await?;
+        }
+        vortex_bail!("Writer stopped before all data was written")
+    })
+}
+
 pub fn copy_to_sink(
     bind_data: &CopyFunctionBind,
     init_global: &CopyFunctionGlobal,
     chunk: &mut DataChunkRef,
 ) -> VortexResult<()> {
-    let chunk = data_chunk_to_vortex(bind_data.fields.names(), chunk);
-    if let Ok(ref array) = chunk {
-        let mut nested = init_global.nested_leaf_stats.lock();
-        let mut ctx = SESSION.create_execution_ctx();
-        accumulate_top_level_nested(array, &mut nested, &mut ctx)?;
-    }
-    let mut sink = init_global
-        .sink
-        .as_ref()
-        .ok_or_else(|| vortex_err!("sink closed early"))?
-        .clone();
-    RUNTIME
-        .block_on(sink.send(chunk))
-        .map_err(|e| vortex_err!("send error {e}"))?;
+    push_to_writer(
+        init_global,
+        data_chunk_to_vortex(bind_data.fields.names(), chunk)?,
+    )
+}
+
+#[derive(Default)]
+pub struct CopyPreparedBatch {
+    arrays: Vec<ArrayRef>,
+}
+
+pub fn prepare_batch_push(
+    bind: &CopyFunctionBind,
+    batch: &mut CopyPreparedBatch,
+    chunk: &DataChunkRef,
+) -> VortexResult<()> {
+    batch
+        .arrays
+        .push(data_chunk_to_vortex(bind.fields.names(), chunk)?);
     Ok(())
 }
 
-pub fn copy_to_finalize(init_global: &mut CopyFunctionGlobal) -> VortexResult<(u64, u64)> {
+pub fn flush_batch(global: &CopyFunctionGlobal, batch: &CopyPreparedBatch) -> VortexResult<()> {
+    for array in &batch.arrays {
+        push_to_writer(global, array.clone())?;
+    }
+    Ok(())
+}
+
+pub fn copy_to_finalize(init_global: &mut CopyFunctionGlobal) -> VortexResult<()> {
     RUNTIME.block_on(async {
         if let Some(sink) = init_global.sink.take() {
             drop(sink)
@@ -524,13 +233,127 @@ pub fn copy_to_finalize(init_global: &mut CopyFunctionGlobal) -> VortexResult<(u
             .lock()
             .take()
             .vortex_expect("no file to close");
+        // Keep the write summary (footer + size) so DuckLake can read per-file statistics back
+        // without re-opening the file. Compute the per-column compressed sizes once, up front.
         let summary = task.await?;
-        let row_count = summary.row_count();
-        let size = summary.size();
-        let nested = std::mem::take(&mut *init_global.nested_leaf_stats.lock());
-        init_global.exported_stats = export_write_summary_stats(&summary, row_count, nested)?;
-        Ok((row_count, size))
+        let column_sizes = summary.compressed_column_sizes().unwrap_or_default();
+        *init_global.finished.lock() = Some(FinishedWrite {
+            summary,
+            column_sizes,
+        });
+        Ok(())
     })
+}
+
+/// File-level statistics of the written Vortex file, for the WRITTEN_FILE_STATISTICS return path.
+pub(crate) struct WrittenFileStats {
+    pub row_count: u64,
+    pub file_size_bytes: u64,
+    pub footer_size_bytes: u64,
+    pub num_columns: usize,
+}
+
+/// Per-column statistics of the written Vortex file. `min`/`max` are DuckDB values converted from
+/// the Vortex scalar; every field is optional and omitted when the statistic is not available.
+pub(crate) struct WrittenColumnStats {
+    pub min: Option<Value>,
+    pub max: Option<Value>,
+    pub null_count: Option<u64>,
+    pub num_values: u64,
+    pub column_size_bytes: Option<u64>,
+    pub has_nan: Option<bool>,
+}
+
+/// Read file-level statistics back from the finished write. `None` before finalize.
+pub(crate) fn written_file_stats(global: &CopyFunctionGlobal) -> Option<WrittenFileStats> {
+    let guard = global.finished.lock();
+    Some(file_stats_from_summary(&guard.as_ref()?.summary))
+}
+
+/// Read per-column statistics for `column_index` from the finished write. `Ok(None)` if the file is
+/// not finalized.
+pub(crate) fn written_column_stats(
+    global: &CopyFunctionGlobal,
+    column_index: usize,
+) -> VortexResult<Option<WrittenColumnStats>> {
+    let guard = global.finished.lock();
+    let Some(finished) = guard.as_ref() else {
+        return Ok(None);
+    };
+    column_stats_from_summary(&finished.summary, column_index, &finished.column_sizes).map(Some)
+}
+
+fn file_stats_from_summary(summary: &WriteSummary) -> WrittenFileStats {
+    let num_columns = summary
+        .footer()
+        .statistics()
+        .map_or(0, |s| s.stats_sets().len());
+    WrittenFileStats {
+        row_count: summary.row_count(),
+        file_size_bytes: summary.size(),
+        // Vortex has no separate footer-size hint; 0 means "read the footer normally".
+        footer_size_bytes: 0,
+        num_columns,
+    }
+}
+
+/// Per-column statistics from a finished write's summary and its precomputed compressed sizes
+/// (`column_sizes`, indexed the same as the footer's stats sets).
+///
+/// Only top-level columns are covered: the footer exposes one statistics set per top-level field,
+/// so nested struct/list leaf columns are not reported (parquet, by contrast, recurses to leaf
+/// paths). Flat tables - the common DuckLake case - are fully covered.
+fn column_stats_from_summary(
+    summary: &WriteSummary,
+    column_index: usize,
+    column_sizes: &[u64],
+) -> VortexResult<WrittenColumnStats> {
+    let file_stats = summary
+        .footer()
+        .statistics()
+        .ok_or_else(|| vortex_err!("written file has no statistics"))?;
+    let stats_sets = file_stats.stats_sets();
+    if column_index >= stats_sets.len() {
+        vortex_bail!(
+            "column index {column_index} out of range for {} statistics sets",
+            stats_sets.len()
+        );
+    }
+    let stats = &stats_sets[column_index];
+    let dtype = &file_stats.dtypes()[column_index];
+
+    Ok(WrittenColumnStats {
+        min: exact_scalar_to_duckdb(stats.get(Stat::Min), dtype)?,
+        max: exact_scalar_to_duckdb(stats.get(Stat::Max), dtype)?,
+        null_count: exact_u64(stats.get(Stat::NullCount)),
+        // NaNCount is exact only for float columns, so this is emitted just for them (as in parquet).
+        has_nan: exact_u64(stats.get(Stat::NaNCount)).map(|count| count > 0),
+        num_values: summary.row_count(),
+        // On-disk compressed size; excludes bytes not attributable to a column (e.g. struct validity).
+        column_size_bytes: column_sizes.get(column_index).copied(),
+    })
+}
+
+/// Convert an exact scalar statistic to a DuckDB value, propagating a conversion failure rather than
+/// dropping it. `Ok(None)` when the statistic is not exactly known.
+fn exact_scalar_to_duckdb(
+    stat: Precision<ScalarValue>,
+    dtype: &DType,
+) -> VortexResult<Option<Value>> {
+    match stat {
+        Precision::Exact(value) => Ok(Some(
+            Scalar::try_new(dtype.clone(), Some(value))?.try_to_duckdb_scalar()?,
+        )),
+        _ => Ok(None),
+    }
+}
+
+/// Extract an exact `u64` statistic (e.g. a count), or `None` if not exactly known.
+fn exact_u64(stat: Precision<ScalarValue>) -> Option<u64> {
+    match stat {
+        Precision::Exact(value) => value.as_primitive().as_u64(),
+        _ => None,
+    }
 }
 
 pub fn copy_to_initialize_global(
@@ -588,14 +411,10 @@ pub fn copy_to_initialize_global(
         })
     };
 
-    let worker_pool = RUNTIME.new_pool();
-    worker_pool.set_workers_to_available_parallelism();
     Ok(CopyFunctionGlobal {
-        worker_pool,
         write_task: Mutex::new(Some(write_task)),
+        finished: Mutex::new(None),
         sink: Some(sink),
-        nested_leaf_stats: Mutex::new(BTreeMap::new()),
-        exported_stats: Vec::new(),
     })
 }
 
@@ -615,19 +434,41 @@ pub fn read_ducklake_field_ids_metadata(file_path: &str) -> VortexResult<Option<
 
 #[cfg(test)]
 mod tests {
-    use super::join_stats_path;
-    use super::quote_ident;
+    use vortex::array::IntoArray;
+    use vortex::array::arrays::StructArray;
+    use vortex::array::stats::PRUNING_STATS;
+    use vortex::buffer::ByteBufferMut;
+    use vortex::buffer::buffer;
+
+    use super::*;
+
+    /// Writes a one-column file and returns its summary, with `file_statistics` controlling which
+    /// statistics the footer carries (empty means none at all).
+    fn write_summary(file_statistics: Vec<Stat>) -> WriteSummary {
+        RUNTIME.block_on(async {
+            let array = StructArray::from_fields(&[("i", buffer![1u32, 2, 3].into_array())])
+                .unwrap()
+                .into_array();
+            let mut buf = ByteBufferMut::empty();
+            let mut writer = SESSION
+                .write_options()
+                .with_file_statistics(file_statistics)
+                .writer(&mut buf, array.dtype().clone());
+            writer.push(array).await.unwrap();
+            writer.finish().await.unwrap()
+        })
+    }
 
     #[test]
-    fn nested_stats_paths_match_parquet_shape() {
-        assert_eq!(quote_ident("l"), "\"l\"");
-        assert_eq!(
-            join_stats_path(&quote_ident("l"), "element"),
-            "\"l\".\"element\""
-        );
-        assert_eq!(
-            join_stats_path(&join_stats_path(&quote_ident("m"), "key"), "x"),
-            "\"m\".\"key\".\"x\""
-        );
+    fn column_stats_out_of_range_is_an_error() {
+        let summary = write_summary(PRUNING_STATS.to_vec());
+        assert!(column_stats_from_summary(&summary, 0, &[]).is_ok());
+        assert!(column_stats_from_summary(&summary, 1, &[]).is_err());
+    }
+
+    #[test]
+    fn column_stats_without_file_statistics_is_an_error() {
+        let summary = write_summary(vec![]);
+        assert!(column_stats_from_summary(&summary, 0, &[]).is_err());
     }
 }

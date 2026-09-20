@@ -13,6 +13,7 @@ use futures::FutureExt;
 use futures::Stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
+use futures::channel::oneshot;
 use futures::future::BoxFuture;
 use futures::pin_mut;
 use futures::stream::BoxStream;
@@ -25,7 +26,7 @@ use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::Dict;
 use vortex_array::builders::dict::DictConstraints;
 use vortex_array::builders::dict::DictEncoder;
-use vortex_array::builders::dict::dict_encoder;
+use vortex_array::builders::dict::dict_encoder_in;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
@@ -195,8 +196,7 @@ impl LayoutStrategy for DictStrategy {
                 let ctx2 = ctx.clone();
                 let segment_sink2 = Arc::clone(&segment_sink);
                 let session2 = session.clone();
-                let codes_fut = handle.spawn_nested(move |h| async move {
-                    let session2 = session2.with_handle(h);
+                let codes_fut = handle.spawn_nested(move |_| async move {
                     codes.write_stream(
                         ctx2,
                         segment_sink2,
@@ -212,8 +212,7 @@ impl LayoutStrategy for DictStrategy {
                 let segment_sink2 = Arc::clone(&segment_sink);
                 let dtype2 = dtype2.clone();
                 let session2 = session.clone();
-                let values_layout = handle.spawn_nested(move |h| async move {
-                    let session2 = session2.with_handle(h);
+                let values_layout = handle.spawn_nested(move |_| async move {
                     values.write_stream(
                         ctx2,
                         segment_sink2,
@@ -561,7 +560,7 @@ fn start_encoding(
     chunk: &ArrayRef,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<EncodingState> {
-    let encoder = dict_encoder(chunk, constraints);
+    let encoder = dict_encoder_in(chunk, constraints, ctx.allocator().clone());
     encode_chunk(encoder, chunk, ctx)
 }
 

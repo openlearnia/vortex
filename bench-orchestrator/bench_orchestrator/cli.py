@@ -6,11 +6,12 @@
 import json
 import os
 import subprocess
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Annotated
+from typing import Annotated, TextIO
 
 import pandas as pd
 import typer
@@ -119,7 +120,7 @@ def backends_for_engines(engines: list[Engine]) -> list[Engine]:
 
 
 @contextmanager
-def open_results_output(path: Path | None):
+def open_results_output(path: Path | None) -> Iterator[TextIO | None]:
     """Open an optional compatibility JSONL output file."""
     if path is None:
         yield None
@@ -133,7 +134,7 @@ def open_results_output(path: Path | None):
 
 
 @contextmanager
-def temporary_ingest_output_dir(enabled: bool):
+def temporary_ingest_output_dir(enabled: bool) -> Iterator[Path | None]:
     """Create a temporary directory for per-backend ingest JSONL files."""
     if not enabled:
         yield None
@@ -177,7 +178,11 @@ def drop_os_caches() -> None:
         pass
 
 
-def write_result_line(line: str, store_writer, compatibility_file) -> None:
+def write_result_line(
+    line: str,
+    store_writer: Callable[[str], object],
+    compatibility_file: TextIO | None,
+) -> None:
     """Write a raw result line to the run store and optional compatibility output."""
     store_writer(line)
     if compatibility_file is None:
@@ -380,36 +385,38 @@ def run(
             for backend, backend_targets in backend_groups.items():
                 executor = BenchmarkExecutor(binary_paths[backend], backend, verbose=verbose)
                 for target in backend_targets:
-                    part_ingest_output = backend_ingest_output_path(ingest_temp_dir, run_idx, backend)
-                    run_idx += 1
 
-                    drop_os_caches()
+                    def stream(line: str) -> None:
+                        write_result_line(line, ctx.write_raw_json, compatibility_file)
 
                     try:
-                        results = executor.run(
-                            benchmark=benchmark,
-                            formats=[target.format],
-                            queries=query_list,
-                            exclude_queries=exclude_list,
-                            iterations=iterations,
-                            options=bench_opts,
-                            track_memory=track_memory,
-                            samply=samply,
-                            sample_rate=sample_rate,
-                            tracing=tracing,
-                            runner=runner,
-                            ingest_output=part_ingest_output,
-                            on_result=lambda line, store_writer=ctx.write_raw_json, compatibility=compatibility_file: (
-                                write_result_line(
-                                    line,
-                                    store_writer,
-                                    compatibility,
-                                )
-                            ),
-                        )
-                        if part_ingest_output is not None:
-                            ingest_output_parts.append(part_ingest_output)
-                        console.print(f"[green]{target}: {len(results)} results[/green]")
+                        query_ids = executor.list_queries(benchmark, query_list, exclude_list)
+                        for query_id in query_ids:
+                            part_ingest_output = None
+                            if ingest_temp_dir is not None:
+                                part_ingest_output = backend_ingest_output_path(ingest_temp_dir, run_idx, backend)
+                                run_idx += 1
+
+                            drop_os_caches()
+
+                            executor.run(
+                                benchmark=benchmark,
+                                formats=[target.format],
+                                query=query_id,
+                                iterations=iterations,
+                                options=bench_opts,
+                                track_memory=track_memory,
+                                samply=samply,
+                                sample_rate=sample_rate,
+                                tracing=tracing,
+                                runner=runner,
+                                ingest_output=part_ingest_output,
+                                on_result=stream,
+                            )
+                            if part_ingest_output is not None:
+                                ingest_output_parts.append(part_ingest_output)
+
+                        console.print(f"[green]{target}: {len(query_ids)} queries[/green]")
                     except RuntimeError as exc:
                         ctx.metadata.partial = True
                         if strict_failures:
@@ -456,19 +463,19 @@ def run(
         PORT = 9001
 
         class TraceRequestHandler(http.server.SimpleHTTPRequestHandler):
-            def do_GET(self):
+            def do_GET(self) -> None:
                 if self.path == "/trace.json":
                     self.path = "trace.json"
                 return super().do_GET()
 
-            def do_POST(self):
+            def do_POST(self) -> None:
                 self.send_error(404, "File not found")
 
-            def end_headers(self):
+            def end_headers(self) -> None:
                 self.send_header("Access-Control-Allow-Origin", "*")
                 super().end_headers()
 
-        def start_server():
+        def start_server() -> None:
             socketserver.TCPServer.allow_reuse_address = True
             with socketserver.TCPServer(("", PORT), TraceRequestHandler) as httpd:
                 console.print(f"[green]Serving trace on http://{HOST}:{PORT}/trace.json[/green]")

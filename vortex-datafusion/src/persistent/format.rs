@@ -5,6 +5,7 @@ use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
+use arrow_schema::DataType;
 use arrow_schema::Schema;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -107,7 +108,7 @@ const DEFAULT_FOOTER_INITIAL_READ_SIZE_BYTES: usize = MAX_POSTSCRIPT_SIZE as usi
 /// let table_url = ListingTableUrl::parse(dir.path().to_str().unwrap())?;
 /// let config = ListingTableConfig::new(table_url)
 ///     .with_listing_options(
-///         ListingOptions::new(format).with_session_config_options(ctx.state().config()),
+///         ListingOptions::new(format),
 ///     )
 ///     .infer_schema(&ctx.state())
 ///     .await?;
@@ -315,6 +316,19 @@ impl VortexFormatFactory {
     pub fn new() -> Self {
         Self {
             session: VortexSession::default(),
+            options: None,
+            expression_convertor: None,
+        }
+    }
+
+    /// Creates a factory with an explicit session and session-driven table options.
+    ///
+    /// Formats created by this factory start from the DataFusion session's `vortex` options,
+    /// falling back to [`VortexTableOptions::default`]. Table-level `OPTIONS(...)` are still
+    /// applied last.
+    pub fn new_with_session(session: VortexSession) -> Self {
+        Self {
+            session,
             options: None,
             expression_convertor: None,
         }
@@ -533,7 +547,13 @@ impl FileFormat for VortexFormat {
                 })
                 .map(|f| f.vortex_expect("Failed to spawn infer_schema"))
             })
-            .buffer_unordered(state.config_options().execution.meta_fetch_concurrency)
+            .buffer_unordered(
+                state
+                    .config_options()
+                    .execution
+                    .meta_fetch_concurrency
+                    .get(),
+            )
             .try_collect::<Vec<_>>()
             .await
             .map_err(|e| DataFusionError::Execution(format!("Failed to infer schema: {e}")))?;
@@ -652,36 +672,26 @@ impl FileFormat for VortexFormat {
                 let column_size =
                     stats_set.get_as::<usize>(Stat::UncompressedSizeInBytes, &PType::U64.into());
 
-                let target_dtype =
-                    session
-                        .arrow()
-                        .from_arrow_field(field.as_ref())
-                        .map_err(|e| {
-                            DataFusionError::Execution(format!(
-                                "Failed to derive Vortex DType for field {}: {e}",
-                                field.name()
-                            ))
-                        })?;
                 let min = scalar_stat_to_df(
                     Stat::Min,
                     stats_set.get(Stat::Min),
                     stats_dtype,
-                    &target_dtype,
+                    field.data_type(),
                 );
 
                 let max = scalar_stat_to_df(
                     Stat::Max,
                     stats_set.get(Stat::Max),
                     stats_dtype,
-                    &target_dtype,
+                    field.data_type(),
                 );
 
                 let null_count = stats_set.get_as::<usize>(Stat::NullCount, &PType::U64.into());
 
                 column_statistics.push(ColumnStatistics {
                     null_count: null_count.to_df(),
-                    min_value: min.to_df(),
-                    max_value: max.to_df(),
+                    min_value: min,
+                    max_value: max,
                     sum_value: DFPrecision::Absent,
                     distinct_count: is_constant_to_distinct_count(
                         stats_set.get_as::<bool>(
@@ -763,20 +773,21 @@ fn scalar_stat_to_df(
     stat: Stat,
     value: Precision<VortexScalarValue>,
     stats_dtype: &DType,
-    target_dtype: &DType,
-) -> Precision<DFScalarValue> {
+    target_dtype: &DataType,
+) -> DFPrecision<DFScalarValue> {
     let Some(stat_dtype) = stat.dtype(stats_dtype) else {
-        return Precision::Absent;
+        return DFPrecision::Absent;
     };
 
     value
-        .map(|stat_value| {
-            Scalar::try_new(stat_dtype, Some(stat_value))?
-                .cast(target_dtype)?
+        .and_then(|stat_value| {
+            let scalar = Scalar::try_new(stat_dtype, Some(stat_value))
+                .ok()?
                 .try_to_df()
+                .ok()?;
+            scalar.cast_to(target_dtype).ok()
         })
-        .transpose()
-        .unwrap_or(Precision::Absent)
+        .to_df()
 }
 
 #[cfg(test)]
@@ -787,6 +798,7 @@ mod tests {
     use arrow_array::Int32Array;
     use arrow_schema::DataType;
     use arrow_schema::Field;
+    use arrow_schema::TimeUnit;
     use datafusion_common::ScalarValue;
     use datafusion_common::config::ConfigOptions;
     use datafusion_expr::Operator;
@@ -794,12 +806,102 @@ mod tests {
     use datafusion_physical_expr::expressions as df_expr;
     use datafusion_physical_expr::projection::ProjectionExprs;
     use datafusion_physical_plan::filter_pushdown::PushedDown;
+    use rstest::rstest;
     use vortex::expr::Expression;
 
     use super::*;
     use crate::common_tests::TestSessionContext;
     use crate::convert::DefaultExpressionConvertor;
     use crate::convert::ProcessedProjection;
+    use crate::convert::scalar_from_df;
+
+    #[rstest]
+    #[case::timestamp_upscale(
+        ScalarValue::TimestampMillisecond(Some(1_234), None),
+        ScalarValue::TimestampMicrosecond(Some(1_234_000), None)
+    )]
+    #[case::timestamp_downscale(
+        ScalarValue::TimestampNanosecond(Some(-1_234_567), None),
+        ScalarValue::TimestampMicrosecond(Some(-1_234), None)
+    )]
+    #[case::timestamp_timezone(
+        ScalarValue::TimestampSecond(Some(123), Some("UTC".into())),
+        ScalarValue::TimestampMillisecond(Some(123_000), Some("UTC".into()))
+    )]
+    #[case::date_upscale(ScalarValue::Date32(Some(2)), ScalarValue::Date64(Some(172_800_000)))]
+    #[case::date_downscale(ScalarValue::Date64(Some(-172_800_000)), ScalarValue::Date32(Some(-2)))]
+    #[case::time_upscale(
+        ScalarValue::Time32Second(Some(123)),
+        ScalarValue::Time64Nanosecond(Some(123_000_000_000))
+    )]
+    #[case::time_downscale(
+        ScalarValue::Time64Microsecond(Some(1_234_567)),
+        ScalarValue::Time32Millisecond(Some(1_234))
+    )]
+    #[case::decimal_scale(
+        ScalarValue::Decimal32(Some(123), 5, 2),
+        ScalarValue::Decimal32(Some(1_230), 6, 3)
+    )]
+    #[case::integer_widening(ScalarValue::Int32(Some(123)), ScalarValue::Int64(Some(123)))]
+    #[case::string_view(ScalarValue::Utf8(Some("value".into())), ScalarValue::Utf8View(Some("value".into())))]
+    #[case::decimal_width(
+        ScalarValue::Decimal32(Some(123), 5, 2),
+        ScalarValue::Decimal128(Some(123), 5, 2)
+    )]
+    fn test_scalar_stat_to_df_cast(
+        #[case] value: ScalarValue,
+        #[case] expected: ScalarValue,
+        #[values(Stat::Min, Stat::Max)] stat: Stat,
+        #[values(true, false)] exact: bool,
+    ) -> VortexResult<()> {
+        let session = VortexSession::default();
+        let scalar = scalar_from_df(&value, &session);
+        let value = scalar
+            .value()
+            .cloned()
+            .ok_or_else(|| vortex_err!("expected non-null scalar"))?;
+        let target_dtype = expected.data_type();
+        let (value, expected) = if exact {
+            (Precision::Exact(value), DFPrecision::Exact(expected))
+        } else {
+            (Precision::Inexact(value), DFPrecision::Inexact(expected))
+        };
+
+        assert_eq!(
+            scalar_stat_to_df(stat, value, scalar.dtype(), &target_dtype),
+            expected
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::timestamp_overflow(
+        ScalarValue::TimestampSecond(Some(10_000_000_000), None),
+        DataType::Timestamp(TimeUnit::Nanosecond, None)
+    )]
+    #[case::timestamp_underflow(
+        ScalarValue::TimestampSecond(Some(-10_000_000_000), None),
+        DataType::Timestamp(TimeUnit::Nanosecond, None)
+    )]
+    #[case::integer_overflow(ScalarValue::Int64(Some(i64::MAX)), DataType::Int32)]
+    #[case::unsupported(ScalarValue::Boolean(Some(true)), DataType::Date32)]
+    fn test_scalar_stat_to_df_failed_cast(
+        #[case] value: ScalarValue,
+        #[case] target_dtype: DataType,
+        #[values(Stat::Min, Stat::Max)] stat: Stat,
+    ) -> VortexResult<()> {
+        let session = VortexSession::default();
+        let scalar = scalar_from_df(&value, &session);
+        let value = scalar
+            .value()
+            .cloned()
+            .ok_or_else(|| vortex_err!("expected non-null scalar"))?;
+        assert_eq!(
+            scalar_stat_to_df(stat, Precision::Exact(value), scalar.dtype(), &target_dtype),
+            DFPrecision::Absent
+        );
+        Ok(())
+    }
 
     #[derive(Clone, Copy)]
     enum PushdownMode {
@@ -880,9 +982,7 @@ mod tests {
         format: &dyn FileFormat,
         calls: &ExpressionConvertorCalls,
     ) -> anyhow::Result<()> {
-        let source = format.file_source(TableSchema::from_file_schema(
-            expression_convertor_test_schema(),
-        ));
+        let source = format.file_source(TableSchema::from(expression_convertor_test_schema()));
         let result = source.try_pushdown_filters(
             vec![expression_convertor_test_filter()],
             &ConfigOptions::new(),
@@ -949,7 +1049,7 @@ mod tests {
             ..Default::default()
         };
         let format = VortexFormat::new_with_options(VortexSession::default(), opts.clone());
-        let table_schema = TableSchema::from_file_schema(Arc::new(Schema::empty()));
+        let table_schema = TableSchema::from(Arc::new(Schema::empty()));
 
         let source = format.file_source(table_schema);
         let source = source

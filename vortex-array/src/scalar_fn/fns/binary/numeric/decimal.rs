@@ -15,6 +15,11 @@
 //! declared precision, so an out-of-precision value can reach a kernel and must not be able to
 //! overflow it. An operation that overflows the result precision on a valid lane is an error;
 //! invalid lanes never error.
+//!
+//! Storage width is independent of precision, so two arrays sharing a dtype may still be stored
+//! at different widths. A mismatched pair is widened to the wider of the two before the lane
+//! loop, zero-copy when they already match, so each working width and operator monomorphizes
+//! one array kernel per storage width rather than one per pair of storage widths.
 
 use std::ops::Mul;
 
@@ -23,6 +28,8 @@ use num_traits::CheckedDiv;
 use num_traits::CheckedMul;
 use num_traits::CheckedSub;
 use vortex_buffer::Buffer;
+use vortex_buffer::BufferAllocatorRef;
+use vortex_buffer::BufferMut;
 use vortex_compute::lane_kernels::LaneZip;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -38,6 +45,7 @@ use crate::arrays::Constant;
 use crate::arrays::ConstantArray;
 use crate::arrays::DecimalArray;
 use crate::arrays::decimal::DecimalArrayExt;
+use crate::arrays::decimal::widened_buffer;
 use crate::dtype::BigCast;
 use crate::dtype::DType;
 use crate::dtype::DecimalDType;
@@ -99,6 +107,7 @@ pub(super) fn execute_numeric_decimal(
                     validity,
                     &valid_rows,
                     &constants,
+                    ctx.allocator(),
                 )
             };
         }
@@ -318,6 +327,10 @@ impl CheckedDecimalOp for CheckedDecimalDiv {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "typed decimal execution parameters"
+)]
 fn execute_decimal_typed<W, Op>(
     lhs: &DecimalOperand,
     rhs: &DecimalOperand,
@@ -326,6 +339,7 @@ fn execute_decimal_typed<W, Op>(
     validity: Validity,
     valid_rows: &Mask,
     constants: &DecimalOpConstants<W>,
+    allocator: &BufferAllocatorRef,
 ) -> VortexResult<ArrayRef>
 where
     W: NativeDecimalType + CheckedAdd + CheckedSub + CheckedMul + CheckedDiv + Mul<Output = W>,
@@ -336,24 +350,30 @@ where
 
     let values = match (lhs, rhs) {
         (DecimalOperand::Array { values: lhs, .. }, DecimalOperand::Array { values: rhs, .. }) => {
-            checked_decimal_arrays::<W, Op>(lhs, rhs, constants, valid_rows)
+            checked_decimal_arrays::<W, Op>(lhs, rhs, constants, valid_rows, allocator)
         }
         (DecimalOperand::Array { values: lhs, .. }, DecimalOperand::Constant { value, .. }) => {
             let rhs = typed_constant::<W>(value);
             match_each_decimal_value_type!(lhs.values_type(), |L| {
                 let lhs = lhs.buffer::<L>();
-                checked_lanes(lhs.as_slice(), valid_rows, |lhs| {
-                    Op::apply(<W as BigCast>::from(lhs)?, rhs, constants)
-                })
+                checked_lanes(
+                    lhs.as_slice(),
+                    valid_rows,
+                    |lhs| Op::apply(<W as BigCast>::from(lhs)?, rhs, constants),
+                    allocator,
+                )
             })
         }
         (DecimalOperand::Constant { value, .. }, DecimalOperand::Array { values: rhs, .. }) => {
             let lhs = typed_constant::<W>(value);
             match_each_decimal_value_type!(rhs.values_type(), |R| {
                 let rhs = rhs.buffer::<R>();
-                checked_lanes(rhs.as_slice(), valid_rows, |rhs| {
-                    Op::apply(lhs, <W as BigCast>::from(rhs)?, constants)
-                })
+                checked_lanes(
+                    rhs.as_slice(),
+                    valid_rows,
+                    |rhs| Op::apply(lhs, <W as BigCast>::from(rhs)?, constants),
+                    allocator,
+                )
             })
         }
         (
@@ -380,6 +400,7 @@ where
         values,
         result_decimal_dtype,
         validity.union_nullability(result_dtype.nullability()),
+        allocator,
     ))
 }
 
@@ -390,6 +411,7 @@ fn decimal_array_narrowed<W: NativeDecimalType>(
     values: Buffer<W>,
     decimal_dtype: DecimalDType,
     validity: Validity,
+    allocator: &BufferAllocatorRef,
 ) -> ArrayRef {
     let target = DecimalType::smallest_decimal_value_type(&decimal_dtype);
     if target == W::DECIMAL_TYPE {
@@ -397,16 +419,12 @@ fn decimal_array_narrowed<W: NativeDecimalType>(
     }
 
     match_each_decimal_value_type!(target, |O| {
-        let narrowed: Buffer<O> = values
-            .as_slice()
-            .iter()
-            .copied()
-            .map(|value| {
-                <O as BigCast>::from(value)
-                    .vortex_expect("precision-checked decimal result must fit the output width")
-            })
-            .collect();
-        DecimalArray::new(narrowed, decimal_dtype, validity).into_array()
+        let mut narrowed = BufferMut::with_capacity_in(values.len(), allocator.clone());
+        narrowed.extend(values.as_slice().iter().copied().map(|value| {
+            <O as BigCast>::from(value)
+                .vortex_expect("precision-checked decimal result must fit the output width")
+        }));
+        DecimalArray::new(narrowed.freeze(), decimal_dtype, validity).into_array()
     })
 }
 
@@ -415,28 +433,31 @@ fn checked_decimal_arrays<W, Op>(
     rhs: &DecimalArray,
     constants: &DecimalOpConstants<W>,
     valid_rows: &Mask,
+    allocator: &BufferAllocatorRef,
 ) -> Result<Buffer<W>, usize>
 where
     W: NativeDecimalType + CheckedAdd + CheckedSub + CheckedMul + CheckedDiv + Mul<Output = W>,
     Op: CheckedDecimalOp,
 {
     debug_assert_eq!(lhs.len(), rhs.len());
-    match_each_decimal_value_type!(lhs.values_type(), |L| {
-        let lhs = lhs.buffer::<L>();
-        match_each_decimal_value_type!(rhs.values_type(), |R| {
-            let rhs = rhs.buffer::<R>();
-            checked_lanes(
-                LaneZip::new(lhs.as_slice(), rhs.as_slice()),
-                valid_rows,
-                |(lhs, rhs)| {
-                    Op::apply(
-                        <W as BigCast>::from(lhs)?,
-                        <W as BigCast>::from(rhs)?,
-                        constants,
-                    )
-                },
-            )
-        })
+    // Dispatch on one storage width, not a pair: a mismatched pair is widened to the wider side
+    // first, which is a copy only in that rare case.
+    let storage = lhs.values_type().max(rhs.values_type());
+    match_each_decimal_value_type!(storage, |L| {
+        let lhs = widened_buffer::<L>(lhs);
+        let rhs = widened_buffer::<L>(rhs);
+        checked_lanes(
+            LaneZip::new(lhs.as_slice(), rhs.as_slice()),
+            valid_rows,
+            |(lhs, rhs)| {
+                Op::apply(
+                    <W as BigCast>::from(lhs)?,
+                    <W as BigCast>::from(rhs)?,
+                    constants,
+                )
+            },
+            allocator,
+        )
     })
 }
 

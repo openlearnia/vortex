@@ -70,6 +70,8 @@ pub use datasets::BenchmarkDataset;
 pub use output::BenchmarkOutput;
 pub use output::create_output_writer;
 use vortex::VortexSessionDefault;
+use vortex::editions::ComponentKind;
+use vortex::editions::EditionSessionExt;
 pub use vortex::error::vortex_panic;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
@@ -139,6 +141,8 @@ impl Display for Target {
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Format {
+    #[clap(name = "arrow-ipc")]
+    ArrowIpc,
     #[clap(name = "csv")]
     Csv,
     #[clap(name = "parquet")]
@@ -167,10 +171,15 @@ impl Display for Format {
 }
 
 /// Allowed formats for benchmark CLI arguments.
-pub const ALLOWED_FORMATS: &[Format] = &[Format::Parquet, Format::OnDiskVortex, Format::Lance];
+pub const ALLOWED_FORMATS: &[Format] = &[
+    Format::ArrowIpc,
+    Format::Parquet,
+    Format::OnDiskVortex,
+    Format::Lance,
+];
 
 impl Format {
-    /// Clap value parser that only accepts parquet, vortex, and lance.
+    /// Clap value parser that only accepts formats supported by random-access benchmarks.
     pub fn parse_allowed(s: &str) -> Result<Format, String> {
         let format = Format::from_str(s, true)?;
         if ALLOWED_FORMATS.contains(&format) {
@@ -186,6 +195,7 @@ impl Format {
 
     pub fn name(&self) -> &'static str {
         match self {
+            Format::ArrowIpc => "arrow-ipc",
             Format::Csv => "csv",
             Format::Parquet => "parquet",
             Format::OnDiskVortex => "vortex-file-compressed",
@@ -198,6 +208,7 @@ impl Format {
 
     pub fn ext(&self) -> &'static str {
         match self {
+            Format::ArrowIpc => "arrow",
             Format::Csv => "csv",
             Format::Parquet => "parquet",
             Format::OnDiskVortex => "vortex",
@@ -244,12 +255,30 @@ impl CompactionStrategy {
         match self {
             CompactionStrategy::Compact => options.with_strategy(
                 WriteStrategyBuilder::default()
-                    .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
+                    .with_btrblocks_builder(retain_edition_encodings(
+                        &SESSION,
+                        BtrBlocksCompressorBuilder::default().with_compact(),
+                    ))
                     .build(),
             ),
             CompactionStrategy::Default => options,
         }
     }
+}
+
+/// Restrict `builder` to the encodings permitted by the session's enabled editions.
+///
+/// The default writer applies this filter itself. An explicit strategy bypasses it, so a
+/// benchmark that builds its own compressor applies it here to stay within editions.
+pub fn retain_edition_encodings(
+    session: &VortexSession,
+    builder: BtrBlocksCompressorBuilder,
+) -> BtrBlocksCompressorBuilder {
+    let allowed = session
+        .enabled_component_ids(ComponentKind::Array)
+        .into_iter()
+        .collect();
+    builder.retain_allowed_encodings(&allowed)
 }
 
 /// Verify that local data has already been prepared for the requested benchmark formats.

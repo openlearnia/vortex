@@ -26,7 +26,7 @@ on:
         type: string
 
 env:
-  NIGHTLY_TOOLCHAIN: nightly-2026-02-05
+  NIGHTLY_TOOLCHAIN: nightly-2026-09-10
 
 jobs:
   attempt-fix:
@@ -272,7 +272,7 @@ jobs:
           CRASH_FILE: ${{ steps.extract.outputs.crash_file }}
           CRASH_FILE_PATH: ${{ steps.download.outputs.crash_file_path }}
           ARTIFACT_URL: ${{ steps.extract.outputs.artifact_url }}
-        uses: anthropics/claude-code-action@6b082c41935b4c8a3b8b0ef85ba4ba4d9eeb8975  # v1
+        uses: anthropics/claude-code-action@bf38e86e58df9ebf3420326d019f955bb3be64dd  # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # Use the App token (not GITHUB_TOKEN) so the committed fix branch and

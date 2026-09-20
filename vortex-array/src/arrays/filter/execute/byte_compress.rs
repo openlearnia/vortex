@@ -1,19 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Byte-level compress for primitive filtering using a `1 << 8 = 256`-entry lookup table.
+//! Byte-level compress for fixed-width filtering using a `1 << 8 = 256`-entry lookup table.
 //!
 //! For each byte of the mask (8 bits -> 8 source elements), a precomputed
 //! permutation table compacts the selected bytes in a single indexed copy,
 //! avoiding the overhead of materializing indices or slices.
 
-use std::mem::size_of;
-
+use vortex_buffer::Alignment;
 use vortex_buffer::Buffer;
+use vortex_buffer::BufferAllocatorRef;
 use vortex_buffer::BufferMut;
 use vortex_mask::MaskValues;
-
-const BYTE_COMPRESS_DENSITY_THRESHOLD: f64 = 0.5;
 
 /// For each mask byte (0..256), stores the element indices to keep and the count.
 ///
@@ -45,28 +43,25 @@ static BYTE_COMPRESS_LUT: &[([u8; 8], u8); 256] = &{
 ///
 /// Processes the mask one byte at a time (8 source elements per byte),
 /// using a precomputed permutation to compact selected elements.
-pub(crate) fn filter_buffer<T: Copy>(buffer: Buffer<T>, mask: &MaskValues) -> Buffer<T> {
-    debug_assert_eq!(buffer.len(), mask.len());
+pub(crate) fn filter_buffer<T: Copy>(
+    buffer: impl AsRef<[T]>,
+    mask: &MaskValues,
+    allocator: &BufferAllocatorRef,
+) -> Buffer<T> {
+    let src = buffer.as_ref();
+    debug_assert_eq!(src.len(), mask.len());
 
-    let src = buffer.as_slice();
     let true_count = mask.true_count();
 
     if true_count == 0 {
-        return Buffer::empty();
+        return BufferMut::empty_aligned_in(Alignment::of::<T>(), allocator.clone()).freeze();
     }
 
     let mask_buffer = mask.bit_buffer();
     let mask_bytes = mask_buffer.inner().as_ref();
     let mask_offset = mask_buffer.offset();
 
-    // Fast path: byte-wide values benefit from avoiding index materialization more often. Wider
-    // values need enough selected values to justify scanning every mask byte directly.
-    if size_of::<T>() == 1 || mask.density() >= BYTE_COMPRESS_DENSITY_THRESHOLD {
-        return filter_bitpacked(src, mask_bytes, mask_offset, true_count);
-    }
-
-    // Slow path: lower-density wide values are better handled by the generic path.
-    super::slice::filter_slice_by_mask_values(src, mask)
+    filter_bitpacked(src, mask_bytes, mask_offset, true_count, allocator)
 }
 
 fn filter_bitpacked<T: Copy>(
@@ -74,8 +69,9 @@ fn filter_bitpacked<T: Copy>(
     mask_bytes: &[u8],
     mask_offset: usize,
     true_count: usize,
+    allocator: &BufferAllocatorRef,
 ) -> Buffer<T> {
-    let mut out = BufferMut::<T>::with_capacity(true_count);
+    let mut out = BufferMut::<T>::with_capacity_in(true_count, allocator.clone());
     let mut write_pos: usize = 0;
 
     if mask_offset == 0 {
@@ -132,17 +128,14 @@ fn filter_chunk_into<T: Copy>(
         return;
     }
 
-    let out_ptr = out.spare_capacity_mut().as_mut_ptr();
     if chunk.len() == 8 && mask_byte == 0xFF {
         // All 8 selected, so bulk copy.
-        // SAFETY: write_pos + 8 <= capacity.
-        unsafe {
-            std::ptr::copy_nonoverlapping(chunk.as_ptr(), out_ptr.add(*write_pos).cast::<T>(), 8);
-        }
+        out.spare_capacity_mut()[*write_pos..][..8].write_copy_of_slice(chunk);
         *write_pos += 8;
         return;
     }
 
+    let out_ptr = out.spare_capacity_mut().as_mut_ptr();
     let (perm, count) = &BYTE_COMPRESS_LUT[mask_byte as usize];
     let count = *count as usize;
     debug_assert_eq!(mask_byte & !low_bits_mask(chunk.len()), 0);
@@ -175,6 +168,10 @@ mod tests {
     use vortex_mask::Mask;
 
     use super::*;
+
+    fn filter_buffer<T: Copy>(buffer: impl AsRef<[T]>, mask: &MaskValues) -> Buffer<T> {
+        super::filter_buffer(buffer, mask, &BufferAllocatorRef::statically_allocated())
+    }
 
     fn mask_values(mask: &Mask) -> &MaskValues {
         match mask {

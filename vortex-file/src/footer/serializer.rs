@@ -3,14 +3,14 @@
 
 use std::sync::Arc;
 
+use vortex_array::flatbuffers::FlatBuffer;
+use vortex_array::flatbuffers::FlatBufferRoot;
+use vortex_array::flatbuffers::WriteFlatBuffer;
+use vortex_array::flatbuffers::WriteFlatBufferExt;
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
-use vortex_flatbuffers::FlatBuffer;
-use vortex_flatbuffers::FlatBufferRoot;
-use vortex_flatbuffers::WriteFlatBuffer;
-use vortex_flatbuffers::WriteFlatBufferExt;
 use vortex_layout::LayoutContext;
 use vortex_session::registry::ReadContext;
 use vortex_utils::aliases::hash_map::HashMap;
@@ -247,7 +247,7 @@ fn write_buffer(
         .map_err(|_| vortex_err!("metadata segment length exceeds maximum u32"))?;
     let alignment = buffer.alignment();
 
-    let padding = offset.next_multiple_of(*alignment as u64) - *offset;
+    let padding = offset.next_multiple_of(alignment.as_usize() as u64) - *offset;
     let segment_offset = *offset + padding;
 
     let segment = PostscriptSegment {

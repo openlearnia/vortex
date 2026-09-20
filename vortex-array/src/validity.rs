@@ -28,7 +28,6 @@ use crate::VortexSessionExecute;
 use crate::arrays::BoolArray;
 use crate::arrays::ChunkedArray;
 use crate::arrays::ConstantArray;
-use crate::arrays::scalar_fn::ScalarFnFactoryExt;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
@@ -164,6 +163,7 @@ impl Validity {
     }
 
     /// Returns whether the `index` item is valid, using `ctx` to execute the validity array.
+    // Todo(joe): deprecate this
     #[inline]
     pub fn execute_is_valid(&self, index: usize, ctx: &mut ExecutionCtx) -> VortexResult<bool> {
         Ok(match self {
@@ -178,6 +178,7 @@ impl Validity {
     }
 
     /// Returns whether the `index` item is null, using `ctx` to execute the validity array.
+    // Todo(joe): deprecate this
     #[inline]
     pub fn execute_is_null(&self, index: usize, ctx: &mut ExecutionCtx) -> VortexResult<bool> {
         Ok(!self.execute_is_valid(index, ctx)?)
@@ -264,6 +265,11 @@ impl Validity {
         }
     }
 
+    /// Execute this validity into a [`Mask`] of the given length.
+    ///
+    /// Resolving [`Validity::Array`] can execute and scan up to `length` values. Optimistic fast
+    /// paths that do not need the exact mask should use [`Self::definitely_no_nulls`] or
+    /// [`Self::definitely_all_null`] and delay this work until necessary.
     #[inline]
     pub fn execute_mask(&self, length: usize, ctx: &mut ExecutionCtx) -> VortexResult<Mask> {
         match self {
@@ -322,8 +328,8 @@ impl Validity {
             | (Validity::AllValid, Validity::AllValid) => Validity::AllValid,
             // Here we actually have to do some work
             (Validity::Array(lhs), Validity::Array(rhs)) => Validity::Array(
-                Binary
-                    .try_new_array(lhs.len(), Operator::And, [lhs, rhs])?
+                Binary::try_new(lhs, rhs, Operator::And)?
+                    .into_array()
                     .optimize()?,
             ),
         })

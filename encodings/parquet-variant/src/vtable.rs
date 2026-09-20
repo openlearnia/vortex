@@ -15,6 +15,7 @@ use vortex_array::arrays::VariantArray;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
+use vortex_array::proto::dtype as pb;
 use vortex_array::serde::ArrayChildren;
 use vortex_array::validity::Validity;
 use vortex_array::vtable::VTable;
@@ -25,7 +26,6 @@ use vortex_error::vortex_ensure;
 use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
-use vortex_proto::dtype as pb;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
@@ -317,6 +317,7 @@ mod tests {
     use vortex_array::dtype::DType;
     use vortex_array::dtype::Nullability;
     use vortex_array::dtype::PType;
+    use vortex_array::dtype::session::DTypeSessionExt;
     use vortex_array::serde::SerializeOptions;
     use vortex_array::serde::SerializedArray;
     use vortex_array::session::ArraySessionExt;
@@ -326,6 +327,7 @@ mod tests {
     use vortex_buffer::BitBuffer;
     use vortex_buffer::ByteBufferMut;
     use vortex_buffer::buffer;
+    use vortex_edition::ComponentKind;
     use vortex_edition::Edition;
     use vortex_edition::EditionId;
     use vortex_edition::EditionInclusion;
@@ -338,6 +340,7 @@ mod tests {
     use vortex_layout::LayoutStrategy;
     use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
     use vortex_layout::session::LayoutSession;
+    use vortex_layout::session::LayoutSessionExt;
     use vortex_session::VortexSession;
     use vortex_session::registry::ReadContext;
 
@@ -407,16 +410,53 @@ mod tests {
         editions
             .declare_edition(Edition {
                 id: TEST_EDITION,
-                min_vortex_version: None,
+                min_library_version: None,
             })
             .map_err(|error| vortex_err!("{error}"))?;
-        let ids = session
-            .arrays()
-            .registry()
-            .read(|map| map.keys().copied().collect::<Vec<_>>());
-        for id in ids {
+        let component_ids = [
+            (
+                ComponentKind::Array,
+                session
+                    .arrays()
+                    .registry()
+                    .read(|map| map.keys().copied().collect::<Vec<_>>()),
+            ),
+            (
+                ComponentKind::Layout,
+                session
+                    .layouts()
+                    .registry()
+                    .read(|map| map.keys().copied().collect::<Vec<_>>()),
+            ),
+            (
+                ComponentKind::DType,
+                session
+                    .dtypes()
+                    .registry()
+                    .read(|map| map.keys().copied().collect::<Vec<_>>()),
+            ),
+        ];
+        for (kind, ids) in component_ids {
+            for id in ids {
+                editions
+                    .declare_inclusion(EditionInclusion::new(kind, &id, TEST_EDITION))
+                    .map_err(|error| vortex_err!("{error}"))?;
+            }
+        }
+        for id in [
+            "vortex.bounded_max",
+            "vortex.bounded_min",
+            "vortex.max",
+            "vortex.min",
+            "vortex.nan_count",
+            "vortex.null_count",
+        ] {
             editions
-                .declare_inclusion(EditionInclusion::array(&id, TEST_EDITION))
+                .declare_inclusion(EditionInclusion::new(
+                    ComponentKind::Aggregate,
+                    id,
+                    TEST_EDITION,
+                ))
                 .map_err(|error| vortex_err!("{error}"))?;
         }
         session

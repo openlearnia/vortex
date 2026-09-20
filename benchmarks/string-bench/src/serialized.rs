@@ -41,6 +41,7 @@ use vortex_bench::Format;
 use vortex_bench::measurements::CustomUnitMeasurement;
 use vortex_btrblocks::SchemeExt;
 use vortex_btrblocks::SchemeId;
+use vortex_btrblocks::schemes::integer::DeltaScheme;
 use vortex_btrblocks::schemes::string::FSSTScheme;
 use vortex_btrblocks::schemes::string::NullDominatedSparseScheme;
 use vortex_btrblocks::schemes::string::OnPairScheme;
@@ -168,13 +169,14 @@ impl SerializedResult {
 }
 
 /// Build the file writer strategy that forces one selected string scheme while
-/// leaving non-string child compression enabled.
+/// leaving editioned non-string child compression enabled.
 fn serialized_write_strategy(encoder: StringEncoder) -> Arc<dyn LayoutStrategy> {
     let forced = encoder.scheme_id();
     let compressor = BtrBlocksCompressorBuilder::default().exclude_schemes(
         default_string_scheme_ids()
             .into_iter()
-            .filter(|&id| id != forced),
+            .filter(|&id| id != forced)
+            .chain([DeltaScheme::default().id()]),
     );
     WriteStrategyBuilder::default()
         .with_btrblocks_builder(compressor)
@@ -348,6 +350,8 @@ mod tests {
     use vortex::VortexSessionDefault;
     use vortex::array::Canonical;
     use vortex::array::VortexSessionExecute;
+    use vortex::editions::CORE_2026_08_3;
+    use vortex::editions::EditionSessionExt;
     use vortex::io::runtime::BlockingRuntime;
     use vortex::io::runtime::current::CurrentThreadRuntime;
     use vortex::io::session::RuntimeSessionExt;
@@ -404,6 +408,7 @@ mod tests {
         let (column, expected_uncompressed_bytes) = crate::repeated_fixture();
         let runtime = CurrentThreadRuntime::new();
         let session = VortexSession::default().with_handle(runtime.handle());
+        session.enable_edition(CORE_2026_08_3)?;
 
         for (encoder, expected_label) in [
             (StringEncoder::OnPair, "onpair-12"),

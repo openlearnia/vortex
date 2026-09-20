@@ -3,6 +3,7 @@
 
 use vortex_buffer::BitBuffer;
 use vortex_buffer::BitBufferMut;
+use vortex_buffer::BufferMut;
 use vortex_buffer::CpuKernel;
 use vortex_buffer::get_bit;
 use vortex_error::VortexExpect;
@@ -129,6 +130,7 @@ fn filter_pext_fallback(src: &BitBuffer, mask_buf: &BitBuffer, true_count: usize
 /// Extracted so the same logic is shared between the software and hardware paths.
 /// Uses raw pointer writes instead of Vec::push to eliminate bounds checks
 /// in the hot loop — we know the exact output size from true_count.
+#[allow(clippy::inline_always)]
 #[inline(always)]
 #[allow(clippy::cast_possible_truncation)]
 fn filter_inner(
@@ -143,7 +145,7 @@ fn filter_inner(
     let mask_chunks = mask_buf.chunks();
 
     let out_u64s = true_count.div_ceil(64);
-    let mut output: Vec<u64> = Vec::with_capacity(out_u64s + 1);
+    let mut output: BufferMut<u64> = BufferMut::with_capacity(out_u64s + 1);
     let out_ptr = output.as_mut_ptr();
     let mut out_idx: usize = 0;
 
@@ -210,15 +212,10 @@ fn filter_inner(
     // SAFETY: we wrote exactly out_idx words, which is <= out_u64s + 1 = capacity.
     unsafe { output.set_len(out_idx) };
 
+    let mut bytes = output.into_byte_buffer();
     let byte_len = true_count.div_ceil(8);
-    let bytes: Vec<u8> = unsafe {
-        let mut v = std::mem::ManuallyDrop::new(output);
-        let ptr = v.as_mut_ptr() as *mut u8;
-        let cap = v.capacity() * 8;
-        Vec::from_raw_parts(ptr, byte_len, cap)
-    };
-
-    BitBuffer::new(bytes.into(), true_count)
+    bytes.truncate(byte_len); // removes up to 7 extra bytes
+    BitBuffer::new(bytes.freeze(), true_count)
 }
 
 /// Byte-level LUT PEXT fallback.
@@ -227,6 +224,7 @@ fn filter_inner(
 /// lookup table per mask byte. Each byte PEXT is a single table lookup with no
 /// data dependencies between bytes, making this faster than the parallel-prefix
 /// approach (~12ns vs ~18ns per word).
+#[allow(clippy::inline_always)]
 #[inline(always)]
 pub fn pext_fallback(src: u64, mask: u64) -> u64 {
     pext_byte_lut(src, mask)
@@ -268,6 +266,7 @@ static BYTE_PEXT_LUT: &[u8; 256 * 256] = &{
 };
 
 /// Byte-level PEXT using precomputed lookup table.
+#[allow(clippy::inline_always)]
 #[inline(always)]
 fn pext_byte_lut(src: u64, mask: u64) -> u64 {
     let src_bytes = src.to_le_bytes();

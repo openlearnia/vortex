@@ -2,18 +2,21 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_buffer::Buffer;
+use vortex_buffer::BufferAllocatorRef;
 use vortex_buffer::BufferMut;
 
 use crate::dtype::IntegerPType;
 
+#[allow(clippy::inline_always)]
 #[inline(always)]
 pub(crate) fn take_values_scalar<T: Copy, I: IntegerPType>(
     values: &[T],
     indices: &[I],
+    allocator: &BufferAllocatorRef,
 ) -> Buffer<T> {
     // The explicit pointer loop keeps the source length in a register and avoids a capacity check
     // for every output value.
-    let mut result = BufferMut::with_capacity(indices.len());
+    let mut result = BufferMut::with_capacity_in(indices.len(), allocator.clone());
     let result_ptr = result.spare_capacity_mut().as_mut_ptr().cast::<T>();
 
     for (output_index, index) in indices.iter().enumerate() {

@@ -28,7 +28,6 @@ itertools = { workspace = true }
 kanal = { workspace = true }
 moka = { workspace = true, features = ["sync"] }
 object_store = { workspace = true, optional = true }
-oneshot.workspace = true
 parking_lot = { workspace = true }
 pin-project-lite = { workspace = true }
 tokio = { workspace = true, features = ["rt"], optional = true }
@@ -45,7 +44,6 @@ vortex-decimal-byte-parts = { workspace = true }
 vortex-edition = { workspace = true }
 vortex-error = { workspace = true }
 vortex-fastlanes = { workspace = true }
-vortex-flatbuffers = { workspace = true, features = ["file"] }
 vortex-fsst = { workspace = true }
 vortex-io = { workspace = true }
 vortex-layout = { workspace = true }
@@ -63,7 +61,11 @@ vortex-utils = { workspace = true, features = ["dashmap"] }
 vortex-zigzag = { workspace = true }
 vortex-zstd = { workspace = true, optional = true }
 
+[build-dependencies]
+vortex-build = { workspace = true }
+
 [dev-dependencies]
+allocator-api2 = { workspace = true }
 divan = { workspace = true }
 rstest = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
@@ -80,6 +82,7 @@ name = "split_collection"
 harness = false
 
 [features]
+default = ["wasm-bindgen"]
 object_store = ["dep:object_store", "vortex-io/object_store", "tokio"]
 tokio = [
     "dep:tokio",
@@ -87,10 +90,6 @@ tokio = [
     "vortex-io/tokio",
     "vortex-layout/tokio",
 ]
+wasm-bindgen = ["vortex-layout/wasm-bindgen"]
 zstd = ["dep:vortex-zstd", "vortex-btrblocks/zstd", "vortex-btrblocks/pco"]
-# This feature enables unstable encodings for which we don't guarantee stability.
-unstable_encodings = [
-    "dep:vortex-tensor",
-    "vortex-zstd?/unstable_encodings",
-    "vortex-btrblocks/unstable_encodings",
-]
+tensor = ["dep:vortex-tensor"]

@@ -5,7 +5,9 @@ use std::any::Any;
 use std::mem::MaybeUninit;
 
 use num_traits::AsPrimitive;
+use vortex_buffer::Alignment;
 use vortex_buffer::BitBufferMut;
+use vortex_buffer::BufferAllocatorRef;
 use vortex_buffer::BufferMut;
 use vortex_buffer::ByteBuffer;
 use vortex_buffer::ByteBufferMut;
@@ -63,29 +65,52 @@ pub struct VarBinBuilder<O: OffsetBuilderPType> {
 
 impl<O: OffsetBuilderPType> VarBinBuilder<O> {
     /// Creates an empty builder for `dtype`.
+    #[deprecated(note = "use `new_in` with an explicit allocator")]
     pub fn new(dtype: DType) -> Self {
-        Self::with_capacity(dtype, 0)
+        Self::new_in(dtype, BufferAllocatorRef::static_ref())
+    }
+
+    /// Creates an empty builder for `dtype` using `allocator`.
+    pub fn new_in(dtype: DType, allocator: &BufferAllocatorRef) -> Self {
+        Self::with_capacity_in(dtype, 0, allocator)
     }
 
     /// Creates a builder for `dtype` with room for `capacity` values.
+    #[deprecated(note = "use `with_capacity_in` with an explicit allocator")]
     pub fn with_capacity(dtype: DType, capacity: usize) -> Self {
+        Self::with_capacity_in(dtype, capacity, BufferAllocatorRef::static_ref())
+    }
+
+    /// Creates a builder for `dtype` with room for `capacity` values using `allocator`.
+    pub fn with_capacity_in(dtype: DType, capacity: usize, allocator: &BufferAllocatorRef) -> Self {
         assert!(
             matches!(dtype, DType::Utf8(_) | DType::Binary(_)),
             "VarBinBuilder dtype must be Utf8 or Binary, got {dtype}"
         );
-        let mut offsets = BufferMut::with_capacity(capacity + 1);
+        let mut offsets = BufferMut::with_capacity_in(capacity + 1, allocator.clone());
         offsets.push(O::zero());
         Self {
             dtype,
             offsets,
-            data: BufferMut::empty(),
-            validity: BitBufferMut::with_capacity(capacity),
+            data: BufferMut::empty_aligned_in(Alignment::of::<u8>(), allocator.clone()),
+            validity: BitBufferMut::with_capacity_in(capacity, allocator.clone()),
         }
     }
 
     /// Creates a builder for `dtype` with room for `capacity` values totalling `bytes` bytes.
+    #[deprecated(note = "use `with_capacity_bytes_in` with an explicit allocator")]
     pub fn with_capacity_bytes(dtype: DType, capacity: usize, bytes: usize) -> Self {
-        let mut builder = Self::with_capacity(dtype, capacity);
+        Self::with_capacity_bytes_in(dtype, capacity, bytes, BufferAllocatorRef::static_ref())
+    }
+
+    /// Creates a builder using `allocator` with room for `capacity` values and `bytes` bytes.
+    pub fn with_capacity_bytes_in(
+        dtype: DType,
+        capacity: usize,
+        bytes: usize,
+        allocator: &BufferAllocatorRef,
+    ) -> Self {
+        let mut builder = Self::with_capacity_in(dtype, capacity, allocator);
         builder.reserve_data(bytes);
         builder
     }
@@ -388,14 +413,11 @@ impl<O: OffsetBuilderPType> VarBinBuilder<O> {
             "The offset count must be one more than the validity length"
         );
 
-        let mut fresh_offsets = BufferMut::with_capacity(1);
-        fresh_offsets.push(O::zero());
-        let offsets = PrimitiveArray::new(
-            std::mem::replace(&mut self.offsets, fresh_offsets).freeze(),
-            Validity::NonNullable,
-        );
-        let data = std::mem::replace(&mut self.data, BufferMut::empty());
-        let nulls = std::mem::replace(&mut self.validity, BitBufferMut::empty()).freeze();
+        let offsets = self.offsets.take();
+        self.offsets.push(O::zero());
+        let offsets = PrimitiveArray::new(offsets.freeze(), Validity::NonNullable);
+        let data = self.data.take();
+        let nulls = self.validity.take().freeze();
 
         let validity = Validity::from_bit_buffer(nulls, self.dtype.nullability());
 
@@ -438,12 +460,7 @@ impl<O: OffsetBuilderPType> VarBinBuilder<O> {
     fn push_value(&mut self, value: &[u8]) {
         self.offsets
             .push(O::from(self.data.len() + value.len()).unwrap_or_else(|| {
-                vortex_panic!(
-                    "Failed to convert sum of {} and {} to offset of type {}",
-                    self.data.len(),
-                    value.len(),
-                    std::any::type_name::<O>()
-                )
+                offset_overflow(self.data.len(), value.len(), std::any::type_name::<O>())
             }));
         self.data.extend_from_slice(value);
     }
@@ -454,17 +471,6 @@ impl<O: OffsetBuilderPType> VarBinBuilder<O> {
             Mask::AllFalse(len) => self.validity.append_n(false, *len),
             Mask::Values(values) => self.validity.append_buffer(values.bit_buffer()),
         }
-    }
-
-    fn replace_validity(&mut self, validity: Mask) {
-        self.validity = match validity {
-            Mask::AllTrue(len) => BitBufferMut::new_set(len),
-            Mask::AllFalse(len) => BitBufferMut::new_unset(len),
-            values @ Mask::Values(_) => values
-                .into_bit_buffer()
-                .try_into_mut()
-                .unwrap_or_else(|buffer| BitBufferMut::copy_from(&buffer)),
-        };
     }
 
     /// Appends `count` end offsets derived from `end_offsets`, shifted past the current data end.
@@ -630,10 +636,6 @@ impl<O: OffsetBuilderPType> ArrayBuilder for VarBinBuilder<O> {
         self.validity.reserve(additional);
     }
 
-    unsafe fn set_validity_unchecked(&mut self, validity: Mask) {
-        self.replace_validity(validity)
-    }
-
     fn finish(&mut self) -> ArrayRef {
         self.finish_into_varbin().into_array()
     }
@@ -701,6 +703,14 @@ macro_rules! __match_varbin_builder_arms {
     };
 }
 
+#[cold]
+#[inline(never)]
+fn offset_overflow(data_len: usize, value_len: usize, offset_type: &'static str) -> ! {
+    vortex_panic!(
+        "Failed to convert sum of {data_len} and {value_len} to offset of type {offset_type}"
+    )
+}
+
 /// Running totals of `lengths`, wrapping so a corrupt lengths child is rejected rather than
 /// panicking; [`VarBinBuilder::extend_offsets`] catches the resulting non-monotonic offsets.
 #[inline]
@@ -739,7 +749,11 @@ mod tests {
 
     #[test]
     fn test_builder() {
-        let mut builder = VarBinBuilder::<i32>::with_capacity(DType::Utf8(Nullable), 0);
+        let mut builder = VarBinBuilder::<i32>::with_capacity_in(
+            DType::Utf8(Nullable),
+            0,
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
         builder.append(Some(b"hello"));
         builder.append(None);
         builder.append(Some(b"world"));
@@ -789,7 +803,10 @@ mod tests {
 
     #[test]
     fn append_n_values_offset_overflow_returns_error() {
-        let mut builder = VarBinBuilder::<i32>::new(DType::Utf8(Nullable));
+        let mut builder = VarBinBuilder::<i32>::new_in(
+            DType::Utf8(Nullable),
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
 
         // The limit is checked before anything is reserved, so the huge byte total is free.
         let result = builder.append_n_values(b"hello", i32::MAX as usize / 5 + 1);
@@ -802,7 +819,10 @@ mod tests {
 
     #[test]
     fn append_values_rejects_a_short_offset_count() {
-        let mut builder = VarBinBuilder::<i32>::new(DType::Utf8(Nullable));
+        let mut builder = VarBinBuilder::<i32>::new_in(
+            DType::Utf8(Nullable),
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
 
         let result = builder.append_values(b"ab", [1usize, 2].into_iter(), &Mask::new_true(3));
 
@@ -813,7 +833,10 @@ mod tests {
 
     #[test]
     fn append_values_rejects_non_monotonic_offsets() {
-        let mut builder = VarBinBuilder::<i32>::new(DType::Utf8(Nullable));
+        let mut builder = VarBinBuilder::<i32>::new_in(
+            DType::Utf8(Nullable),
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
 
         let result = builder.append_values(b"ab", [2usize, 1].into_iter(), &Mask::new_true(2));
 
@@ -824,7 +847,10 @@ mod tests {
     #[test]
     fn append_decoded_writes_into_the_builder_storage() -> VortexResult<()> {
         let mut ctx = array_session().create_execution_ctx();
-        let mut builder = VarBinBuilder::<i32>::new(DType::Utf8(Nullable));
+        let mut builder = VarBinBuilder::<i32>::new_in(
+            DType::Utf8(Nullable),
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
 
         // SAFETY: the closure initializes exactly the 6 bytes it reports.
         unsafe {
@@ -852,7 +878,10 @@ mod tests {
     /// should not pay for a full decompression first.
     #[test]
     fn append_decoded_rejects_an_offset_overflow_without_decoding() {
-        let mut builder = VarBinBuilder::<i32>::new(DType::Utf8(Nullable));
+        let mut builder = VarBinBuilder::<i32>::new_in(
+            DType::Utf8(Nullable),
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
         let num_bytes = i32::MAX as usize + 1;
         let mut decoded = false;
 
@@ -874,7 +903,10 @@ mod tests {
     /// column wider than the offset type errors like the bulk appends do.
     #[test]
     fn append_scalar_repeated_rejects_an_offset_overflow() {
-        let mut builder = VarBinBuilder::<i32>::new(DType::Utf8(Nullable));
+        let mut builder = VarBinBuilder::<i32>::new_in(
+            DType::Utf8(Nullable),
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
 
         let result = builder
             .append_scalar_repeated(&Scalar::utf8("hello", Nullable), i32::MAX as usize / 5 + 1);
@@ -887,7 +919,10 @@ mod tests {
 
     #[test]
     fn append_decoded_rejects_a_short_decode() {
-        let mut builder = VarBinBuilder::<i32>::new(DType::Utf8(Nullable));
+        let mut builder = VarBinBuilder::<i32>::new_in(
+            DType::Utf8(Nullable),
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
 
         // SAFETY: the closure initializes the 3 bytes it reports (none, and it reports 3 — but the
         // length mismatch is rejected before anything is published).
@@ -910,7 +945,10 @@ mod tests {
     #[case::all_valid(Mask::new_true(2))]
     #[case::some_valid(Mask::from_iter([true, false, true]))]
     fn append_valid_slices_rejects_a_byte_count_mismatch(#[case] validity: Mask) {
-        let mut builder = VarBinBuilder::<i32>::new(DType::Utf8(Nullable));
+        let mut builder = VarBinBuilder::<i32>::new_in(
+            DType::Utf8(Nullable),
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
         let values = [b"foo".as_slice(), b"quux".as_slice()];
 
         let mut next = 0;
@@ -928,7 +966,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "The offset count must be one more than the validity length")]
     fn finish_rejects_mismatched_validity() {
-        let mut builder = VarBinBuilder::<i32>::new(DType::Utf8(Nullable));
+        let mut builder = VarBinBuilder::<i32>::new_in(
+            DType::Utf8(Nullable),
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
         builder.validity.append_true();
         drop(builder.finish_into_varbin());
     }
@@ -938,22 +979,19 @@ mod tests {
     #[case(true)]
     fn test_array_builder_methods(#[case] large_offsets: bool) -> VortexResult<()> {
         let mut ctx = array_session().create_execution_ctx();
-        for validity in [
-            Mask::new_true(3),
-            Mask::new_false(3),
-            Mask::from_iter([true, false, true]),
-        ] {
-            let result = with_offsets(large_offsets, DType::Utf8(Nullable), |builder| {
-                builder.reserve_exact(3);
-                builder.append_zero();
-                builder.append_scalar(&Scalar::utf8("hello", Nullable))?;
-                builder.append_null();
-                assert_eq!(builder.len(), 3);
-                builder.set_validity(validity.clone());
-                Ok(())
-            })?;
-            assert_eq!(result.validity()?.execute_mask(3, &mut ctx)?, validity);
-        }
+        let result = with_offsets(large_offsets, DType::Utf8(Nullable), |builder| {
+            builder.reserve_exact(3);
+            builder.append_zero();
+            builder.append_scalar(&Scalar::utf8("hello", Nullable))?;
+            builder.append_null();
+            assert_eq!(builder.len(), 3);
+            Ok(())
+        })?;
+
+        assert_eq!(
+            result.validity()?.execute_mask(3, &mut ctx)?,
+            Mask::from_iter([true, true, false])
+        );
         Ok(())
     }
 
@@ -991,10 +1029,10 @@ mod tests {
     /// only matched the signed pair would send an unsigned builder down a downcast that assumes
     /// `VarBinViewBuilder` and panic.
     #[rstest]
-    #[case::u32(VarBinBuilder::<u32>::new(DType::Utf8(Nullable)))]
-    #[case::u64(VarBinBuilder::<u64>::new(DType::Utf8(Nullable)))]
-    #[case::i32(VarBinBuilder::<i32>::new(DType::Utf8(Nullable)))]
-    #[case::i64(VarBinBuilder::<i64>::new(DType::Utf8(Nullable)))]
+    #[case::u32(VarBinBuilder::<u32>::new_in(DType::Utf8(Nullable), vortex_buffer::BufferAllocatorRef::static_ref()))]
+    #[case::u64(VarBinBuilder::<u64>::new_in(DType::Utf8(Nullable), vortex_buffer::BufferAllocatorRef::static_ref()))]
+    #[case::i32(VarBinBuilder::<i32>::new_in(DType::Utf8(Nullable), vortex_buffer::BufferAllocatorRef::static_ref()))]
+    #[case::i64(VarBinBuilder::<i64>::new_in(DType::Utf8(Nullable), vortex_buffer::BufferAllocatorRef::static_ref()))]
     fn append_to_every_offset_width(#[case] mut builder: impl ArrayBuilder) -> VortexResult<()> {
         let mut ctx = array_session().create_execution_ctx();
         let long = "a string that is far too long to be inlined in a view";
@@ -1015,7 +1053,11 @@ mod tests {
 
     #[test]
     fn offsets_have_is_sorted_stat() -> VortexResult<()> {
-        let mut builder = VarBinBuilder::<i32>::with_capacity(DType::Utf8(Nullable), 0);
+        let mut builder = VarBinBuilder::<i32>::with_capacity_in(
+            DType::Utf8(Nullable),
+            0,
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
         builder.append_value(b"aaa");
         builder.push_null();
         builder.append_value(b"bbb");
@@ -1031,7 +1073,10 @@ mod tests {
 
     #[test]
     fn empty_builder_offsets_have_is_sorted_stat() -> VortexResult<()> {
-        let mut builder = VarBinBuilder::<i32>::new(DType::Utf8(Nullable));
+        let mut builder = VarBinBuilder::<i32>::new_in(
+            DType::Utf8(Nullable),
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
         let array = builder.finish_into_varbin();
 
         let is_sorted = array
@@ -1049,11 +1094,19 @@ mod tests {
         f: impl FnOnce(&mut dyn ArrayBuilder) -> VortexResult<()>,
     ) -> VortexResult<VarBinArray> {
         if large_offsets {
-            let mut builder = VarBinBuilder::<i64>::with_capacity(dtype, 8);
+            let mut builder = VarBinBuilder::<i64>::with_capacity_in(
+                dtype,
+                8,
+                vortex_buffer::BufferAllocatorRef::static_ref(),
+            );
             f(&mut builder)?;
             Ok(builder.finish_into_varbin())
         } else {
-            let mut builder = VarBinBuilder::<i32>::with_capacity(dtype, 8);
+            let mut builder = VarBinBuilder::<i32>::with_capacity_in(
+                dtype,
+                8,
+                vortex_buffer::BufferAllocatorRef::static_ref(),
+            );
             f(&mut builder)?;
             Ok(builder.finish_into_varbin())
         }

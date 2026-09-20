@@ -12,6 +12,7 @@ use vortex_array::Canonical;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::arrays::BoolArray;
+use vortex_array::arrays::DecimalArray;
 use vortex_array::arrays::FixedSizeList;
 use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::ListView;
@@ -26,17 +27,17 @@ use vortex_array::arrays::VarBinViewArray;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArrayExt;
 use vortex_array::arrays::listview::ListViewArrayExt;
 use vortex_array::arrays::listview::ListViewArraySlotsExt;
+use vortex_array::arrays::listview::ListViewRebuildMode;
 use vortex_array::arrays::primitive::PrimitiveArrayExt;
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::varbinview::build_views::BinaryView;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::builders::ArrayBuilder;
-use vortex_array::builders::DecimalBuilder;
 use vortex_array::builders::FixedSizeListBuilder;
 use vortex_array::builders::ListViewBuilder;
 use vortex_array::builders::VarBinBuilder;
 use vortex_array::builders::VarBinViewBuilder;
-use vortex_array::builders::builder_with_capacity;
+use vortex_array::builders::builder_with_capacity_in;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::DecimalDType;
 use vortex_array::dtype::DecimalType;
@@ -372,18 +373,31 @@ fn execute_sparse_lists(
     // instead of 8. `O` is already unsigned (from `match_smallest_list_offset_type`).
     let indices = resolved.indices().as_::<Primitive>().into_owned();
     let indices = indices.reinterpret_cast(indices.ptype().to_unsigned());
-    let values = resolved.values().as_::<ListView>().into_owned();
     let fill_list = fill_value.as_list();
 
+    // Flatten the patch views up front so that runs of them can be appended as slices below. An
+    // exact layout also trims `elements` to exactly what the patches reference, so the patch half
+    // of the count below is what the builder will actually hold rather than an over-estimate.
+    let values = resolved
+        .values()
+        .clone()
+        .downcast::<ListView>()
+        .rebuild(ListViewRebuildMode::MakeExact, ctx)?;
+
+    // Each gap between patches is appended as one constant array, whose canonical form points
+    // every view at a single copy of the fill value, so a gap costs the fill value's elements once
+    // however many rows it covers. Bound the number of gaps: there is at most one on either side of
+    // each patch, and each one covers at least one row.
     let n_filled = len - resolved.num_patches();
-    let total_canonical_values = values.elements().len() + fill_list.len() * n_filled;
+    let n_fill_runs = (resolved.num_patches() + 1).min(n_filled);
+    let total_canonical_values = values.elements().len() + fill_list.len() * n_fill_runs;
 
     Ok(match_each_unsigned_integer_ptype!(indices.ptype(), |I| {
         match_smallest_list_offset_type!(total_canonical_values, |O| {
             execute_sparse_lists_inner::<I, O>(
                 indices.as_slice(),
                 values,
-                fill_list,
+                fill_value,
                 values_dtype,
                 len,
                 total_canonical_values,
@@ -398,7 +412,7 @@ fn execute_sparse_lists(
 fn execute_sparse_lists_inner<I: IntegerPType, O: OffsetBuilderPType>(
     patch_indices: &[I],
     patch_values: ListViewArray,
-    fill_scalar: ListScalar,
+    fill_value: &Scalar,
     values_dtype: Arc<DType>,
     len: usize,
     total_canonical_values: usize,
@@ -407,24 +421,27 @@ fn execute_sparse_lists_inner<I: IntegerPType, O: OffsetBuilderPType>(
 ) -> ArrayRef {
     // Create the builder with appropriate types. It is easy to just use the same type for both
     // `offsets` and `sizes` since we have no other constraints.
-    let mut builder = ListViewBuilder::<O, O>::with_capacity(
+    let mut builder = ListViewBuilder::<O, O>::with_capacity_in(
         values_dtype,
         nullability,
         total_canonical_values,
         len,
+        ctx.allocator(),
     );
-    let fill_elements = list_scalar_elements_array(fill_scalar);
-    let patch_values_validity = patch_values
+    // The fill's elements become an array once, up front. Every gap then appends that same array,
+    // so the fill's elements are stored once for the whole result however many gaps reference them.
+    let fill_elements = list_scalar_elements_array(fill_value.as_list(), ctx.allocator());
+
+    // One mask for the whole patch array rather than a validity lookup per patch.
+    let patch_validity = patch_values
         .listview_validity()
         .execute_mask(patch_values.len(), ctx)
         .vortex_expect("sparse list validity mask failed to execute");
 
     let mut next_index = 0;
 
-    for ((patch_idx, sparse_idx), patch_valid) in patch_indices
-        .iter()
-        .enumerate()
-        .zip(patch_values_validity.iter())
+    for ((patch_idx, sparse_idx), patch_valid) in
+        patch_indices.iter().enumerate().zip(patch_validity.iter())
     {
         let sparse_idx = sparse_idx
             .to_usize()
@@ -437,6 +454,9 @@ fn execute_sparse_lists_inner<I: IntegerPType, O: OffsetBuilderPType>(
             ctx,
         );
 
+        // Take each patch's elements rather than slicing the patch array itself: slicing a
+        // `ListView` slices its offsets, its sizes and its elements, and every one of those slices
+        // pays an optimizer pass, where this pays one for the elements alone.
         if patch_valid {
             let patch_list = patch_values
                 .list_elements_at(patch_idx)
@@ -456,6 +476,46 @@ fn execute_sparse_lists_inner<I: IntegerPType, O: OffsetBuilderPType>(
     builder.finish()
 }
 
+/// Materializes a list scalar's elements into an array, or `None` if the scalar is null.
+fn list_scalar_elements_array(
+    list: ListScalar,
+    allocator: &vortex_buffer::BufferAllocatorRef,
+) -> Option<ArrayRef> {
+    list.elements().map(|elements| {
+        let mut builder = builder_with_capacity_in(list.element_dtype(), elements.len(), allocator);
+        for element in elements {
+            builder
+                .append_scalar(&element)
+                .vortex_expect("list element scalar was invalid");
+        }
+        builder.finish()
+    })
+}
+
+/// Appends the run of `count` fill lists that covers the gap before the next patch.
+///
+/// The whole run goes in as one append that points `count` views at a single copy of
+/// `fill_elements`, so a gap costs nothing per row it covers.
+fn append_list_fill<O: OffsetBuilderPType, S: OffsetBuilderPType>(
+    builder: &mut ListViewBuilder<O, S>,
+    fill_elements: Option<&ArrayRef>,
+    count: usize,
+    ctx: &mut ExecutionCtx,
+) {
+    if count == 0 {
+        return;
+    }
+
+    match fill_elements {
+        Some(fill_elements) => builder
+            .append_array_as_repeated_list(fill_elements, count, ctx)
+            .vortex_expect("Failed to append sparse fill value"),
+        // A null fill has no elements to share, and the builder can record the nulls without
+        // going through an array at all.
+        None => builder.append_nulls(count),
+    }
+}
+
 /// Canonicalize a sparse [`FixedSizeListArray`] by expanding it into a dense representation.
 fn execute_sparse_fixed_size_list(
     resolved: &Patches,
@@ -466,13 +526,12 @@ fn execute_sparse_fixed_size_list(
 ) -> VortexResult<ArrayRef> {
     let indices = resolved.indices().as_::<Primitive>().into_owned();
     let values = resolved.values().as_::<FixedSizeList>().into_owned();
-    let fill_scalar = fill_value.as_list();
 
     Ok(match_each_integer_ptype!(indices.ptype(), |I| {
         execute_sparse_fixed_size_list_inner::<I>(
             indices.as_slice(),
             values,
-            fill_scalar,
+            fill_value,
             len,
             nullability,
             ctx,
@@ -488,9 +547,9 @@ fn execute_sparse_fixed_size_list(
 /// elements (or defaults if null). Since all lists have the same size, we can directly append
 /// elements without tracking offsets.
 fn execute_sparse_fixed_size_list_inner<I: IntegerPType>(
-    indices: &[I],
+    patch_indices: &[I],
     values: FixedSizeListArray,
-    fill_scalar: ListScalar,
+    fill_value: &Scalar,
     array_len: usize,
     nullability: Nullability,
     ctx: &mut ExecutionCtx,
@@ -500,26 +559,35 @@ fn execute_sparse_fixed_size_list_inner<I: IntegerPType>(
         .dtype()
         .as_fixed_size_list_element_opt()
         .vortex_expect("sparse fixed-size-list values must have fixed-size-list dtype");
-    let mut builder = FixedSizeListBuilder::with_capacity(
+    let mut builder = FixedSizeListBuilder::with_capacity_in(
         Arc::clone(element_dtype),
         list_size,
         nullability,
         array_len,
+        ctx.allocator(),
     );
-    let fill_elements = list_scalar_elements_array(fill_scalar);
-    let values_validity = values
+    // The fill's elements become an array once, up front, so that a gap does not rebuild them.
+    // They are tiled per row rather than shared - a fixed-size list holds its elements back to
+    // back - unless they are all the same scalar, in which case the tile stays constant-encoded
+    // and the tiling costs nothing.
+    let fill_elements = fixed_size_list_fill_tile(fill_value.as_list(), list_size, ctx.allocator());
+
+    // One mask for the whole patch array rather than a validity lookup per patch.
+    let patch_validity = values
         .validity()
         .vortex_expect("sparse fixed-size-list validity should be derivable")
         .execute_mask(values.len(), ctx)
         .vortex_expect("sparse fixed-size-list validity mask failed to execute");
 
     let mut next_index = 0;
-    let indices = indices
-        .iter()
-        .map(|x| (*x).to_usize().vortex_expect("index must fit in usize"));
 
-    for ((patch_idx, sparse_idx), patch_valid) in indices.enumerate().zip(values_validity.iter()) {
+    for ((patch_idx, sparse_idx), patch_valid) in
+        patch_indices.iter().enumerate().zip(patch_validity.iter())
+    {
         // Fill gap before this patch with fill values.
+        let sparse_idx = sparse_idx
+            .to_usize()
+            .vortex_expect("patch index must fit in usize");
         append_fixed_size_list_fill(
             &mut builder,
             fill_elements.as_ref(),
@@ -527,7 +595,9 @@ fn execute_sparse_fixed_size_list_inner<I: IntegerPType>(
             ctx,
         );
 
-        // Append the patch value, handling null patches by appending defaults.
+        // Take each patch's elements rather than slicing the patch array itself: slicing a
+        // `FixedSizeList` slices its elements and its validity, and every one of those slices pays
+        // an optimizer pass, where this pays one for the elements alone.
         if patch_valid {
             let patch_list = values
                 .fixed_size_list_elements_at(patch_idx)
@@ -553,49 +623,50 @@ fn execute_sparse_fixed_size_list_inner<I: IntegerPType>(
     builder.finish_into_fixed_size_list()
 }
 
-fn list_scalar_elements_array(list: ListScalar) -> Option<ArrayRef> {
-    list.elements().map(|elements| {
-        let mut builder = builder_with_capacity(list.element_dtype(), elements.len());
-        for element in elements {
-            builder
-                .append_scalar(&element)
-                .vortex_expect("list element scalar was invalid");
+/// Materializes the elements a fixed-size-list fill value covers each of its rows with, or `None`
+/// if the fill is null.
+///
+/// Elements that are all the same scalar stay a constant array, so tiling them over a gap costs
+/// nothing however many rows it covers.
+fn fixed_size_list_fill_tile(
+    fill: ListScalar,
+    list_size: u32,
+    allocator: &vortex_buffer::BufferAllocatorRef,
+) -> Option<ArrayRef> {
+    let elements = fill.elements()?;
+
+    Some(match elements.iter().all_equal_value() {
+        Ok(uniform) => ConstantArray::new(uniform.clone(), list_size as usize).into_array(),
+        Err(_) => {
+            let mut builder =
+                builder_with_capacity_in(fill.element_dtype(), elements.len(), allocator);
+            for element in &elements {
+                builder
+                    .append_scalar(element)
+                    .vortex_expect("fixed-size-list element scalar was invalid");
+            }
+            builder.finish()
         }
-        builder.finish()
     })
 }
 
-fn append_list_fill<O: OffsetBuilderPType, S: OffsetBuilderPType>(
-    builder: &mut ListViewBuilder<O, S>,
-    fill_elements: Option<&ArrayRef>,
-    count: usize,
-    ctx: &mut ExecutionCtx,
-) {
-    if let Some(fill_elements) = fill_elements {
-        for _ in 0..count {
-            builder
-                .append_array_as_list(fill_elements, ctx)
-                .vortex_expect("Failed to append sparse fill value");
-        }
-    } else {
-        builder.append_nulls(count);
-    }
-}
-
+/// Appends the run of `count` fill lists that covers the gap before the next patch.
 fn append_fixed_size_list_fill(
     builder: &mut FixedSizeListBuilder,
     fill_elements: Option<&ArrayRef>,
     count: usize,
     ctx: &mut ExecutionCtx,
 ) {
-    if let Some(fill_elements) = fill_elements {
-        for _ in 0..count {
-            builder
-                .append_array_as_list(fill_elements, ctx)
-                .vortex_expect("Failed to append sparse fixed-size-list fill value");
-        }
-    } else {
-        builder.append_nulls(count);
+    if count == 0 {
+        return;
+    }
+
+    match fill_elements {
+        Some(fill_elements) => builder
+            .append_array_as_repeated_list(fill_elements, count, ctx)
+            .vortex_expect("Failed to append sparse fixed-size-list fill value"),
+        // A null fill has no elements of its own, only the placeholders the builder writes.
+        None => builder.append_nulls(count),
     }
 }
 
@@ -714,21 +785,23 @@ fn execute_sparse_decimal<D: NativeDecimalType>(
     len: usize,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
-    let mut builder = DecimalBuilder::with_capacity::<D>(len, decimal_dtype, nullability);
-    match fill_value.decimal_value() {
-        Some(fill_value) => {
-            let fill_value = fill_value
-                .cast::<D>()
-                .vortex_expect("unexpected value type");
-            for _ in 0..len {
-                builder.append_value(fill_value)
-            }
-        }
-        None => {
-            builder.append_nulls(len);
-        }
-    }
-    let filled_array = builder.finish_into_decimal();
+    // Fill the buffer in one go rather than a value at a time, as the other fills do.
+    let (values, validity) = match fill_value.decimal_value() {
+        Some(fill_value) => (
+            Buffer::full(
+                fill_value
+                    .cast::<D>()
+                    .vortex_expect("unexpected value type"),
+                len,
+            ),
+            Validity::from(nullability),
+        ),
+        None => (Buffer::<D>::zeroed(len), Validity::AllInvalid),
+    };
+
+    // SAFETY: the buffer holds `len` values of the dtype's value type, and the validity carries no
+    // length of its own.
+    let filled_array = unsafe { DecimalArray::new_unchecked(values, decimal_dtype, validity) };
     Ok(filled_array.patch(patches, ctx)?.into_array())
 }
 
@@ -802,6 +875,7 @@ mod test {
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::BoolArray;
+    use vortex_array::arrays::Chunked;
     use vortex_array::arrays::DecimalArray;
     use vortex_array::arrays::FixedSizeListArray;
     use vortex_array::arrays::ListArray;
@@ -810,6 +884,7 @@ mod test {
     use vortex_array::arrays::StructArray;
     use vortex_array::arrays::VarBinArray;
     use vortex_array::arrays::VarBinViewArray;
+    use vortex_array::arrays::chunked::ChunkedArrayExt;
     use vortex_array::arrays::listview::ListViewArrayExt;
     use vortex_array::arrays::listview::ListViewArraySlotsExt;
     use vortex_array::assert_arrays_eq;
@@ -1503,6 +1578,149 @@ mod test {
         Ok(())
     }
 
+    /// Each gap between patches is appended as a single constant array, so the fill value's
+    /// elements are stored once per gap however many rows the gap covers.
+    #[test]
+    fn test_sparse_list_fill_stores_one_copy_per_gap() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+
+        // Two single-element patch lists: [1] and [2].
+        let lists = unsafe {
+            ListViewArray::new_unchecked(
+                buffer![1i32, 2].into_array(),
+                buffer![0u32, 1].into_array(),
+                buffer![1u32, 1].into_array(),
+                Validity::AllValid,
+            )
+            .with_zero_copy_to_list(true)
+        }
+        .into_array();
+
+        // Patches at 10 and 20 of 10,000 rows, so the fill covers three gaps.
+        let indices = buffer![10u32, 20].into_array();
+        let fill = vec![7i32, 8, 9];
+        let sparse =
+            Sparse::try_new(indices, lists, 10_000, Scalar::from(Some(fill.clone())))?.into_array();
+
+        let actual = sparse.execute::<ListViewArray>(&mut ctx)?;
+        assert_eq!(actual.len(), 10_000);
+        assert_eq!(
+            actual.elements().len(),
+            2 + 3 * fill.len(),
+            "the fill value should be stored once per gap, not once per row",
+        );
+
+        let fill_elements = PrimitiveArray::from_iter(fill);
+        for index in [0, 9, 11, 19, 21, 9_999] {
+            assert_arrays_eq!(
+                actual.list_elements_at(index).vortex_expect("fill list"),
+                fill_elements,
+                &mut ctx
+            );
+        }
+        assert_arrays_eq!(
+            actual.list_elements_at(10).vortex_expect("patch list"),
+            PrimitiveArray::from_iter([1i32]),
+            &mut ctx
+        );
+        assert_arrays_eq!(
+            actual.list_elements_at(20).vortex_expect("patch list"),
+            PrimitiveArray::from_iter([2i32]),
+            &mut ctx
+        );
+
+        Ok(())
+    }
+
+    /// Nested builders chunk a child on the boundaries it is appended on, so the number of appends
+    /// canonicalization makes is visible in the elements child. Patches go in one at a time, so
+    /// they cost a chunk each; a gap covers all its rows with a single append, so it costs one
+    /// chunk however many rows it fills.
+    #[test]
+    fn test_sparse_list_chunks_elements_per_patch_and_once_per_gap() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+
+        const PATCHES: usize = 100;
+        let patches_u32 = u32::try_from(PATCHES).vortex_expect("fits in u32");
+        let patches_i32 = i32::try_from(PATCHES).vortex_expect("fits in i32");
+
+        // `PATCHES` single-element lists, patched onto rows 0..PATCHES of a 2 * PATCHES-row array,
+        // so there is exactly one patch run followed by exactly one gap.
+        let patch_values = ListViewArray::new(
+            PrimitiveArray::from_iter(0..patches_i32).into_array(),
+            PrimitiveArray::from_iter(0..patches_u32).into_array(),
+            PrimitiveArray::from_iter(std::iter::repeat_n(1u32, PATCHES)).into_array(),
+            Validity::AllValid,
+        )
+        .into_array();
+
+        let indices = PrimitiveArray::from_iter(0..patches_u32).into_array();
+        let fill = Scalar::from(Some(vec![-1i32]));
+        let sparse = Sparse::try_new(indices, patch_values, 2 * PATCHES, fill)?.into_array();
+
+        let actual = sparse.execute::<ListViewArray>(&mut ctx)?;
+        assert_eq!(
+            actual.elements().as_::<Chunked>().nchunks(),
+            PATCHES + 1,
+            "expected one chunk per patch and a single chunk for the whole gap",
+        );
+
+        let expected_lists = (0..patches_i32)
+            .map(|i| Some(vec![i]))
+            .chain(std::iter::repeat_n(Some(vec![-1i32]), PATCHES));
+        let expected = ListArray::from_iter_opt_slow::<u32, _, _>(
+            expected_lists,
+            Arc::new(PType::I32.into()),
+        )?;
+        assert_arrays_eq!(actual, expected, &mut ctx);
+
+        Ok(())
+    }
+
+    /// Patches on consecutive rows are appended as one slice of the patch array, so this covers the
+    /// run arithmetic together with everything that has to survive it: a null patch inside a run,
+    /// patch views that overlap and are out of order, runs separated by gaps, and a trailing gap.
+    #[test]
+    fn test_sparse_list_appends_consecutive_patches_as_one_run() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+
+        // Overlapping, out-of-order patch views over three elements:
+        // - patch 0: [20, 30]
+        // - patch 1: [10]      (null, so its elements are never read)
+        // - patch 2: [10, 20, 30]
+        // - patch 3: [10, 20]
+        let patches = unsafe {
+            ListViewArray::new_unchecked(
+                buffer![10i32, 20, 30].into_array(),
+                buffer![1u32, 0, 0, 0].into_array(),
+                buffer![2u32, 1, 3, 2].into_array(),
+                Validity::from_iter([true, false, true, true]),
+            )
+        };
+        assert!(!patches.is_zero_copy_to_list());
+
+        // Rows 0..3 are one run of patches, row 5 is another, and rows 3-4 and 6 are gaps.
+        let indices = buffer![0u8, 1, 2, 5].into_array();
+        let fill = Scalar::from(Some(vec![7i32, 8]));
+        let sparse = Sparse::try_new(indices, patches.into_array(), 7, fill)?.into_array();
+
+        let actual = sparse.execute::<ListViewArray>(&mut ctx)?;
+
+        // The seven elements the patches reference, plus one copy of the two-element fill for each
+        // of the two gaps. The run of patches on rows 0..3 has no gap inside it to pay for.
+        assert_eq!(actual.elements().len(), 7 + 2 * 2);
+
+        let expected = ListViewArray::new(
+            buffer![20i32, 30, 10, 20, 30, 7, 8, 7, 8, 10, 20, 7, 8].into_array(),
+            buffer![0u8, 2, 2, 5, 7, 9, 11].into_array(),
+            buffer![2u8, 0, 3, 2, 2, 2, 2].into_array(),
+            Validity::from_iter([true, false, true, true, true, true, true]),
+        );
+        assert_arrays_eq!(actual, expected, &mut ctx);
+
+        Ok(())
+    }
+
     #[test]
     fn test_sparse_binary_varbin_null_fill() {
         let mut ctx = SESSION.create_execution_ctx();
@@ -1983,11 +2201,18 @@ mod test {
         for candidate in [array.clone(), array.slice(1..9)?] {
             let expected = candidate.clone().execute::<VarBinViewArray>(&mut ctx)?;
 
-            let mut view_builder = VarBinViewBuilder::with_capacity(candidate.dtype().clone(), 4);
+            let mut view_builder = VarBinViewBuilder::with_capacity_in(
+                candidate.dtype().clone(),
+                4,
+                vortex_buffer::BufferAllocatorRef::statically_allocated(),
+            );
             candidate.append_to_builder(&mut view_builder, &mut ctx)?;
             assert_arrays_eq!(view_builder.finish_into_varbinview(), expected, &mut ctx);
 
-            let mut varbin_builder = VarBinBuilder::<i32>::new(candidate.dtype().clone());
+            let mut varbin_builder = VarBinBuilder::<i32>::new_in(
+                candidate.dtype().clone(),
+                vortex_buffer::BufferAllocatorRef::static_ref(),
+            );
             candidate.append_to_builder(&mut varbin_builder, &mut ctx)?;
             assert_arrays_eq!(varbin_builder.finish_into_varbin(), expected, &mut ctx);
         }

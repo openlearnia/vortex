@@ -50,66 +50,12 @@ use crate::exporter::primitive;
 use crate::exporter::spatial;
 use crate::exporter::struct_;
 use crate::exporter::temporal;
+// Upstream UUID exporter; DuckLake extension types (hugeint, interval, enum,
+// bit/bignum, variant, timetz) export below.
+use crate::exporter::uuid;
 use crate::exporter::validity;
 use crate::exporter::varbinview;
 use crate::{cpp, duckdb::VectorRef};
-
-struct UuidExporter {
-    values: Vec<cpp::duckdb_hugeint>,
-}
-
-impl ColumnExporter for UuidExporter {
-    fn export(
-        &self,
-        offset: usize,
-        len: usize,
-        vector: &mut VectorRef,
-        _ctx: &mut ExecutionCtx,
-    ) -> VortexResult<()> {
-        unsafe {
-            vector
-                .as_slice_mut::<cpp::duckdb_hugeint>(len)
-                .copy_from_slice(&self.values[offset..offset + len]);
-        }
-        Ok(())
-    }
-}
-
-fn new_uuid_exporter(
-    ext: ExtensionArray,
-    ctx: &mut ExecutionCtx,
-) -> VortexResult<Box<dyn ColumnExporter>> {
-    let storage = ext
-        .storage_array()
-        .clone()
-        .execute::<FixedSizeListArray>(ctx)?;
-    let len = storage.len();
-    let parts = storage.into_data_parts();
-    if parts.validity.definitely_all_null() {
-        return Ok(all_invalid::new_exporter());
-    }
-    let mask = parts.validity.to_array(len).execute(ctx)?;
-    let bytes = parts.elements.execute::<PrimitiveArray>(ctx)?;
-    let values = bytes
-        .as_slice::<u8>()
-        .chunks_exact(16)
-        .map(|bytes| {
-            let mut upper_bytes = [0; 8];
-            upper_bytes.copy_from_slice(&bytes[..8]);
-            let mut lower_bytes = [0; 8];
-            lower_bytes.copy_from_slice(&bytes[8..]);
-            let upper = u64::from_be_bytes(upper_bytes) ^ (1_u64 << 63);
-            cpp::duckdb_hugeint {
-                lower: u64::from_be_bytes(lower_bytes),
-                upper: upper as i64,
-            }
-        })
-        .collect();
-    Ok(validity::new_exporter(
-        mask,
-        Box::new(UuidExporter { values }),
-    ))
-}
 
 fn new_hugeint_exporter(
     ext: ExtensionArray,
@@ -136,7 +82,7 @@ fn new_hugeint_exporter(
         .collect();
     Ok(validity::new_exporter(
         mask,
-        Box::new(UuidExporter { values }),
+        Box::new(HugeIntExporter { values }),
     ))
 }
 
@@ -182,6 +128,27 @@ fn new_interval_exporter(
     ))
 }
 
+struct HugeIntExporter {
+    values: Vec<cpp::duckdb_hugeint>,
+}
+
+impl ColumnExporter for HugeIntExporter {
+    fn export(
+        &self,
+        offset: usize,
+        len: usize,
+        vector: &mut VectorRef,
+        _ctx: &mut ExecutionCtx,
+    ) -> VortexResult<()> {
+        unsafe {
+            vector
+                .as_slice_mut::<cpp::duckdb_hugeint>(len)
+                .copy_from_slice(&self.values[offset..offset + len]);
+        }
+        Ok(())
+    }
+}
+
 struct IntervalExporter {
     values: Vec<DuckdbIntervalPhysical>,
 }
@@ -213,7 +180,7 @@ pub(crate) fn new_exporter(
     }
 
     if ext.ext_dtype().is::<Uuid>() {
-        return new_uuid_exporter(ext, ctx);
+        return uuid::new_exporter(ext, ctx);
     }
 
     if ext.ext_dtype().is::<DuckHugeInt>()

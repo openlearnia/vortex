@@ -239,29 +239,9 @@ impl FromLogicalType for DType {
                     .erased(),
                 )
             }
-            DUCKDB_TYPE::DUCKDB_TYPE_VARIANT => {
-                let storage = DType::Struct(
-                    (0..logical_type.struct_type_child_count())
-                        .map(|i| {
-                            Ok((
-                                logical_type.struct_child_name(i),
-                                DType::from_logical_type(
-                                    &logical_type.struct_child_type(i),
-                                    Nullability::Nullable,
-                                )?,
-                            ))
-                        })
-                        .collect::<VortexResult<_>>()?,
-                    nullability,
-                );
-                DType::Extension(
-                    ExtDType::<crate::convert::ext_types::DuckVariant>::try_new(
-                        crate::convert::ext_types::EmptyExtMetadata,
-                        storage,
-                    )?
-                    .erased(),
-                )
-            }
+            // Upstream: VARIANT maps to the native Vortex Variant dtype.
+            DUCKDB_TYPE::DUCKDB_TYPE_VARIANT => DType::Variant(nullability),
+            // DuckLake parity: interval/enum/bit/bignum/timetz extension types.
             DUCKDB_TYPE::DUCKDB_TYPE_INTERVAL => {
                 crate::convert::ext_types::interval_dtype(nullability)?
             }
@@ -362,6 +342,8 @@ impl TryFrom<&DType> for LogicalType {
                     return Ok(LogicalType::new(DUCKDB_TYPE::DUCKDB_TYPE_UUID));
                 }
 
+                // DuckLake extension dtypes (interval, enum, bit/bignum, timetz, variant…)
+                // map back to their DuckDB logical types.
                 if let Some(duckdb_ext) =
                     crate::convert::ext_types::logical_type_from_duckdb_ext(ext_dtype)?
                 {
@@ -398,10 +380,9 @@ fn temporal_to_duckdb(temporal: TemporalMetadata) -> VortexResult<LogicalType> {
             TimeUnit::Seconds => DUCKDB_TYPE::DUCKDB_TYPE_TIMESTAMP_S,
             _ => vortex_bail!("Invalid TimeUnit {} for timestamp", unit),
         },
-        TemporalMetadata::Timestamp(unit, Some(tz)) => {
-            if tz.as_ref() != "UTC" {
-                vortex_bail!("Invalid timezone for timestamp_tz {tz}, must be UTC");
-            }
+        // TIMESTAMP_TZ's timezone is a display unit, time is stored in UTC
+        // microseconds
+        TemporalMetadata::Timestamp(unit, Some(_)) => {
             if unit != &TimeUnit::Microseconds {
                 vortex_bail!(
                     "Invalid TimeUnit {} for timestamp_tz, must be Microseconds",
@@ -824,6 +805,31 @@ mod tests {
 
         let original = DType::from_logical_type(&duckdb_geometry, Nullability::NonNullable)?;
         assert_eq!(original, vortex_geometry);
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[case(Nullability::NonNullable)]
+    #[case(Nullability::Nullable)]
+    fn test_uuid_roundtrip(#[case] nullability: Nullability) -> VortexResult<()> {
+        use vortex::extension::uuid::Uuid;
+        use vortex::extension::uuid::UuidMetadata;
+
+        let storage = DType::FixedSizeList(
+            Arc::new(DType::Primitive(PType::U8, Nullability::NonNullable)),
+            16,
+            nullability,
+        );
+        let vortex_uuid = DType::Extension(
+            ExtDType::<Uuid>::try_with_vtable(Uuid, UuidMetadata::default(), storage)?.erased(),
+        );
+
+        let duckdb_uuid = LogicalType::try_from(&vortex_uuid)?;
+        assert_eq!(duckdb_uuid.as_type_id(), cpp::DUCKDB_TYPE::DUCKDB_TYPE_UUID);
+
+        let original = DType::from_logical_type(&duckdb_uuid, nullability)?;
+        assert_eq!(original, vortex_uuid);
 
         Ok(())
     }

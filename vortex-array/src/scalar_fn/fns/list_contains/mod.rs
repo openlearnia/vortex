@@ -25,10 +25,10 @@ use crate::arrays::Constant;
 use crate::arrays::ConstantArray;
 use crate::arrays::ListViewArray;
 use crate::arrays::PrimitiveArray;
+use crate::arrays::ScalarFnArray;
 use crate::arrays::bool::BoolArrayExt;
 use crate::arrays::listview::ListViewArraySlotsExt;
 use crate::arrays::primitive::PrimitiveArrayExt;
-use crate::arrays::scalar_fn::ScalarFnFactoryExt;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::IntegerPType;
@@ -43,12 +43,24 @@ use crate::scalar_fn::EmptyOptions;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
+use crate::scalar_fn::ScalarFnVTableExt;
 use crate::scalar_fn::fns::binary::Binary;
 use crate::scalar_fn::fns::operators::Operator;
 use crate::validity::Validity;
 
 #[derive(Clone)]
 pub struct ListContains;
+
+impl ListContains {
+    /// Creates a lazy list membership check for `needle` in `list`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the children have different lengths or `list` is not a list array.
+    pub fn try_new(list: ArrayRef, needle: ArrayRef) -> VortexResult<ScalarFnArray> {
+        ScalarFnArray::try_new(ListContains.bind(EmptyOptions), vec![list, needle])
+    }
+}
 
 impl ScalarFnVTable for ListContains {
     type Options = EmptyOptions;
@@ -126,8 +138,8 @@ impl ScalarFnVTable for ListContains {
         false
     }
 
-    fn is_fallible(&self, _options: &Self::Options) -> bool {
-        false
+    fn is_infallible(&self, _options: &Self::Options) -> bool {
+        true
     }
 }
 
@@ -197,16 +209,13 @@ fn constant_list_scalar_contains(
     let result = elements
         .iter()
         .map(|element| {
-            Binary
-                .try_new_array(
-                    len,
-                    Operator::Eq,
-                    [
-                        ConstantArray::new(element.clone(), len).into_array(),
-                        values.clone(),
-                    ],
-                )?
-                .fill_null(false_scalar.clone())
+            Binary::try_new(
+                ConstantArray::new(element.clone(), len).into_array(),
+                values.clone(),
+                Operator::Eq,
+            )?
+            .into_array()
+            .fill_null(false_scalar.clone())
         })
         .collect::<VortexResult<Vec<_>>>()?
         .into_iter()
@@ -233,15 +242,12 @@ fn list_contains_scalar(
     let elems = list_array.elements();
     if elems.is_empty() {
         // Must return false when a list is empty (but valid), or null when the list itself is null.
-        return list_false_or_null(&list_array, nullability);
+        return list_false_or_null(&list_array, nullability, ctx);
     }
 
     let rhs = ConstantArray::new(value.clone(), elems.len());
-    let matching_elements = Binary.try_new_array(
-        elems.len(),
-        Operator::Eq,
-        &[elems.clone(), rhs.clone().into_array()],
-    )?;
+    let matching_elements =
+        Binary::try_new(elems.clone(), rhs.clone().into_array(), Operator::Eq)?.into_array();
 
     // TODO(ngates): we should execute this into a Columnar and check for constant.
     let matches = matching_elements.execute::<BoolArray>(ctx)?;
@@ -257,7 +263,7 @@ fn list_contains_scalar(
                     "Search value must not be null here"
                 );
                 // False, unless the list itself is null in which case we return null.
-                list_false_or_null(&list_array, nullability)
+                list_false_or_null(&list_array, nullability, ctx)
             }
             // No elements match, and all comparisons are valid (result in `false`).
             Some(false) => {
@@ -288,7 +294,7 @@ fn list_contains_scalar(
     // Process based on the offset and size types.
     let list_matches = match_each_unsigned_integer_ptype!(offsets.ptype(), |O| {
         match_each_unsigned_integer_ptype!(sizes.ptype(), |S| {
-            process_matches::<O, S>(matches, list_array.len(), offsets, sizes)
+            process_matches::<O, S>(matches, list_array.len(), offsets, sizes, ctx)
         })
     });
 
@@ -306,6 +312,7 @@ fn process_matches<O, S>(
     list_array_len: usize,
     offsets: PrimitiveArray,
     sizes: PrimitiveArray,
+    ctx: &mut ExecutionCtx,
 ) -> BitBuffer
 where
     O: IntegerPType,
@@ -315,8 +322,9 @@ where
     let sizes_slice = sizes.as_slice::<S>();
     let bits = matches.bit_buffer_view();
 
-    (0..list_array_len)
-        .map(|i| {
+    BitBuffer::collect_bool_in(
+        list_array_len,
+        |i| {
             let offset = offsets_slice[i].as_();
             let size = sizes_slice[i].as_();
 
@@ -324,8 +332,9 @@ where
             // `Some(_)`, at least one element in this list's range matches.
             let mut set_bits = BitIndexIterator::new(bits.inner(), offset, size);
             set_bits.next().is_some()
-        })
-        .collect::<BitBuffer>()
+        },
+        ctx.allocator().clone(),
+    )
 }
 
 /// Returns a `Bool` array with `false` for lists that are valid,
@@ -333,6 +342,7 @@ where
 fn list_false_or_null(
     list_array: &ListViewArray,
     nullability: Nullability,
+    ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     match list_array.validity()? {
         Validity::NonNullable => {
@@ -356,7 +366,7 @@ fn list_false_or_null(
         }
         Validity::Array(validity_array) => {
             // Create a new bool array with false, and the provided nulls
-            let buffer = BitBuffer::new_unset(list_array.len());
+            let buffer = BitBuffer::new_unset_in(list_array.len(), ctx.allocator().clone());
             Ok(BoolArray::new(buffer, Validity::Array(validity_array)).into_array())
         }
     }
@@ -380,7 +390,12 @@ fn list_is_not_empty(
 
     let sizes = list_array.sizes().clone().execute::<PrimitiveArray>(ctx)?;
     let buffer = match_each_integer_ptype!(sizes.ptype(), |S| {
-        BitBuffer::from_iter(sizes.as_slice::<S>().iter().map(|&size| size != S::zero()))
+        let sizes = sizes.as_slice::<S>();
+        BitBuffer::collect_bool_in(
+            sizes.len(),
+            |idx| sizes[idx] != S::zero(),
+            ctx.allocator().clone(),
+        )
     });
 
     // Copy over the validity mask from the input.

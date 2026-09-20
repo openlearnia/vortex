@@ -19,7 +19,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  NIGHTLY_TOOLCHAIN: nightly-2026-02-05
+  NIGHTLY_TOOLCHAIN: nightly-2026-09-10
 
 jobs:
   duckdb-mirror:
@@ -44,6 +44,8 @@ jobs:
   rust-coverage:
     name: "Rust tests (coverage) (${{ matrix.suite }})"
     needs: duckdb-ready
+    # The PR-only mirror is a skipped ancestor on develop; override implicit success().
+    if: ${{ !cancelled() && needs.duckdb-ready.result == 'success' }}
     timeout-minutes: 30
     permissions:
       id-token: write
@@ -53,7 +55,7 @@ jobs:
           - suite: tests
     runs-on: >-
       ${{ github.repository == 'vortex-data/vortex'
-          && format('runs-on={0}/runner=amd64-large/disk=large/image=ubuntu24-full-x64-pre-v2/tag=rust-coverage-suite-{1}', github.run_id, matrix.suite)
+          && format('runs-on={0}/runner=amd64-large/volume=200gb/image=ubuntu24-full-x64-pre-v2/tag=rust-coverage-suite-{1}', github.run_id, matrix.suite)
           || 'ubuntu-latest' }}
     env:
       RUSTFLAGS: "-Cinstrument-coverage -A warnings"
@@ -61,11 +63,12 @@ jobs:
       LLVM_PROFILE_FILE: "target/coverage/vortex-%p-%m.profraw"
       GRCOV_OUTPUT_FILE: "target/coverage/vortex.lcov"
     steps:
-      - uses: runs-on/action@v2
-        if: github.repository == 'vortex-data/vortex'
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: runs-on/action@v2
+            if: github.repository == 'vortex-data/vortex'
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"
@@ -100,9 +103,9 @@ jobs:
             --llvm-path "${LLVM_TOOLS_BIN}" \
             --threads $(nproc) \
             --ignore '../*' --ignore '/*' --ignore 'fuzz/*' --ignore 'vortex-bench/*' \
-            --ignore 'home/*' --ignore 'xtask/*' --ignore 'target/*' --ignore 'vortex-error/*' \
-            --ignore 'vortex-python/*' --ignore 'vortex-jni/*' --ignore 'vortex-flatbuffers/*' \
-            --ignore 'vortex-proto/*' --ignore 'vortex-tui/*' --ignore 'vortex-datafusion/examples/*' \
+            --ignore 'home/*' --ignore 'xtask/*' --ignore 'vortex-build/*' --ignore 'target/*' --ignore 'vortex-error/*' \
+            --ignore 'vortex-python/*' --ignore 'vortex-jni/*' \
+            --ignore 'vortex-tui/*' --ignore 'vortex-datafusion/examples/*' \
             --ignore 'vortex-ffi/examples/*' --ignore '*/arbitrary/*' --ignore '*/arbitrary.rs' \
             --ignore benchmarks/* --ignore 'vortex-test/*' \
             -o ${{ env.GRCOV_OUTPUT_FILE }}
@@ -119,6 +122,9 @@ jobs:
   cxx-coverage:
     name: "C++ API (coverage)"
     timeout-minutes: 15
+    env:
+      # Symbolizing error backtrace in debug .so is slow
+      RUST_LIB_BACKTRACE: 0
     permissions:
       id-token: write
     runs-on: >-
@@ -126,20 +132,21 @@ jobs:
           && format('runs-on={0}/runner=amd64-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=cxx-coverage', github.run_id)
           || 'ubuntu-latest' }}
     steps:
-      - uses: runs-on/action@v2
-        if: github.repository == 'vortex-data/vortex'
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: runs-on/action@v2
+            if: github.repository == 'vortex-data/vortex'
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"
       - name: Install lcov
         run: |
-          sudo apt-get update
-          sudo apt-get install -y lcov libjson-xs-perl
-      - name: Build FFI library
-        run: cargo build -p vortex-ffi
+          if ! command -v lcov >/dev/null || ! dpkg-query -W libjson-xs-perl >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y lcov libjson-xs-perl
+          fi
       - name: Build and test C++ API with coverage
         working-directory: lang/cpp
         run: ./gcov-report.sh
@@ -166,7 +173,7 @@ jobs:
     name: "Rust tests (${{ matrix.sanitizer }})"
     runs-on: >-
       ${{ github.repository == 'vortex-data/vortex'
-          && format('runs-on={0}/pool=amd64-medium-pre-v2/tag=rust-test-sanitizer', github.run_id)
+          && format('runs-on={0}/runner=amd64-medium/image=ubuntu24-full-x64-pre-v2/extras=s3-cache/tag=rust-test-sanitizer', github.run_id)
           || 'ubuntu-latest' }}
     timeout-minutes: 30
     env:
@@ -182,11 +189,12 @@ jobs:
       # unset -Zsanitizer flag and we should allow that.
       RUSTFLAGS: "-A warnings -Cunsafe-allow-abi-mismatch=sanitizer -C debuginfo=2 -C opt-level=0 -C strip=none"
     steps:
-      - uses: runs-on/action@v2
-        if: github.repository == 'vortex-data/vortex'
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: runs-on/action@v2
+            if: github.repository == 'vortex-data/vortex'
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"
@@ -208,17 +216,14 @@ jobs:
             --target x86_64-unknown-linux-gnu -Zbuild-std \
             -p vortex-buffer -p vortex-fastlanes -p vortex-fsst -p vortex-alp -p vortex-array
 
-        # vortex-ffi requires --no-default-features as otherwise we pull in
-        # Mimalloc which interferes with sanitizers
         # cargo nextest reports less sanitizer issues than cargo test
-        # TODO(myrrc): remove --no-default-features once we make Mimalloc opt-in
         # --tests skips doctests: rustdoc ignores RUSTFLAGS (it uses RUSTDOCFLAGS),
         # so doctests would build vortex-ffi without -Zsanitizer and mismatch the
         # sanitizer-built deps.
       - name: Run vortex-ffi tests with sanitizer
         run: |
           RUSTFLAGS="${RUSTFLAGS} ${{ matrix.sanitizer_flags }}" \
-          cargo +$NIGHTLY_TOOLCHAIN test --locked --no-default-features \
+          cargo +$NIGHTLY_TOOLCHAIN test --locked \
             --target x86_64-unknown-linux-gnu --no-fail-fast -Zbuild-std \
             -p vortex-ffi --tests -- --no-capture
 
@@ -230,11 +235,10 @@ jobs:
           # We don't run memory sanitizer as it's clang-only and provides many
           # false positives for Catch2
           - sanitizer: asan
-            sanitizer_flags: "-Zsanitizer=address,leak"
           - sanitizer: tsan
-            sanitizer_flags: "-Zsanitizer=thread"
     name: "Rust/C++ FFI tests (${{ matrix.sanitizer }})"
-    timeout-minutes: 5
+    # Allow cold builds of Rust's sanitizer-instrumented standard library.
+    timeout-minutes: 15
     env:
       ASAN_OPTIONS: "symbolize=1:check_initialization_order=1:detect_leaks=1:leak_check_at_exit=1"
       LSAN_OPTIONS: "report_objects=1"
@@ -244,39 +248,40 @@ jobs:
       TSAN_OPTIONS: "symbolize=1:suppressions=${{ github.workspace }}/vortex-ffi/tsan_suppressions.txt"
       TSAN_SYMBOLIZER_PATH: "/usr/bin/llvm-symbolizer"
       VORTEX_SKIP_SLOW_TESTS: "1"
-      # -Cunsafe-allow-abi-mismatch=sanitizer: libraries like compiler_builtins
-      # unset -Zsanitizer flag and we should allow that.
+      # Symbolizing error backtrace in debug .so is slow
+      RUST_LIB_BACKTRACE: 0
     runs-on: >-
       ${{ github.repository == 'vortex-data/vortex'
           && format('runs-on={0}/runner=amd64-medium/image=ubuntu24-full-x64-pre-v2/tag=rust-ffi-test-sanitizer', github.run_id)
           || 'ubuntu-latest' }}
     steps:
-      - uses: runs-on/action@v2
-        if: github.repository == 'vortex-data/vortex'
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: runs-on/action@v2
+            if: github.repository == 'vortex-data/vortex'
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"
-      - name: Install Rust nightly toolchain
-        run: |
-          rustup toolchain install $NIGHTLY_TOOLCHAIN
-          rustup component add --toolchain $NIGHTLY_TOOLCHAIN rust-src rustfmt clippy llvm-tools-preview
-      - name: Build FFI library
-        run: |
-          # TODO(myrrc): remove --no-default-features
-          RUSTFLAGS="-A warnings -Cunsafe-allow-abi-mismatch=sanitizer \
-                -C debuginfo=2 -C opt-level=0 -C strip=none -Zexternal-clangrt \
-                ${{ matrix.sanitizer_flags }}" \
-          cargo +$NIGHTLY_TOOLCHAIN build --locked --no-default-features \
-            --target x86_64-unknown-linux-gnu -Zbuild-std \
-            -p vortex-ffi
-      - name: Build FFI library tests and examples
+          toolchain: ${{ env.NIGHTLY_TOOLCHAIN }}
+          components: "rust-src, rustfmt, clippy, llvm-tools-preview"
+      - name: Build FFI library, tests, and examples
         working-directory: vortex-ffi
+        env:
+          RUSTUP_TOOLCHAIN: ${{ env.NIGHTLY_TOOLCHAIN }}
         run: |
-          cmake -Bbuild -DBUILD_TESTS=1 -DBUILD_EXAMPLES=1 -DSANITIZER=${{ matrix.sanitizer }} -DTARGET_TRIPLE="x86_64-unknown-linux-gnu"
-          cmake --build build -j
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_LINKER_TYPE=MOLD \
+            -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DVORTEX_SANITIZER=${{ matrix.sanitizer }} \
+            -DVORTEX_SANITIZE_RUST_STD=ON \
+            -DVORTEX_BUILD_TESTS=ON \
+            -DVORTEX_BUILD_EXAMPLES=ON
+          cmake --build build --parallel "$(nproc)"
       - name: Run tests
         run: |
           set -o pipefail
@@ -303,11 +308,12 @@ jobs:
       RUSTFLAGS: "-A warnings"
       RUST_BACKTRACE: full
     steps:
-      - uses: runs-on/action@v2
-        if: github.repository == 'vortex-data/vortex'
-        with:
-          sccache: s3
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - parallel:
+          - uses: runs-on/action@v2
+            if: github.repository == 'vortex-data/vortex'
+            with:
+              sccache: s3
+          - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: ./.github/actions/setup-prebuild
         with:
           enable-sccache: "true"

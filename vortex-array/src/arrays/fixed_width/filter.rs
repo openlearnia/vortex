@@ -1,53 +1,62 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::sync::Arc;
-
 use vortex_buffer::Buffer;
+use vortex_buffer::BufferAllocatorRef;
 use vortex_buffer::BufferMut;
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexExpect;
 use vortex_mask::MaskValues;
+use vortex_mask::MaskValuesRef;
 
 use super::FixedWidthArray;
 use super::match_each_record_width;
 use super::with_values;
 use crate::array::Array;
 use crate::arrays::filter::filter_buffer;
-use crate::arrays::filter::filter_buffer_byte_compress;
 use crate::arrays::filter::filter_validity;
 
 #[cfg(test)]
 #[expect(clippy::cast_possible_truncation)]
 mod tests;
 
-pub(crate) fn filter<V: FixedWidthArray>(array: &Array<V>, mask: &Arc<MaskValues>) -> Array<V> {
+pub(crate) fn filter<V: FixedWidthArray>(
+    array: &Array<V>,
+    mask: &MaskValuesRef,
+    allocator: &BufferAllocatorRef,
+) -> Array<V> {
     let array = array.as_view();
-    let values = filter_records(V::values(array), V::byte_width(array), mask);
+    let values = filter_records(
+        V::values(array),
+        V::byte_width(array),
+        mask.as_ref(),
+        allocator,
+    );
     let validity = filter_validity(
         array
             .validity()
-            .vortex_expect("fixed-width validity should be derivable"),
+            .vortex_expect("validity is derivable for a valid fixed-width array"),
         mask,
     );
     with_values(array, values, mask.true_count(), validity)
         .vortex_expect("filtering fixed-width values preserves array invariants")
 }
 
-fn filter_records(values: ByteBuffer, byte_width: usize, mask: &MaskValues) -> ByteBuffer {
+fn filter_records(
+    values: ByteBuffer,
+    byte_width: usize,
+    mask: &MaskValues,
+    allocator: &BufferAllocatorRef,
+) -> ByteBuffer {
     let alignment = values.alignment();
 
     match_each_record_width!(
         byte_width,
         |W| {
             let records = Buffer::<[u8; W]>::from_byte_buffer(values);
-            // Byte-compress processes eight records per mask byte and wins for narrow records,
-            // while wider records move enough bytes each for the plain filter to win.
-            let filtered = if W <= 4 {
-                filter_buffer_byte_compress(records, mask)
-            } else {
-                filter_buffer(records, mask)
-            };
+            // `filter_buffer` picks between in-place compaction, cached indices/slices,
+            // byte-compress, and bitmap iteration based on record width and mask density.
+            let filtered = filter_buffer(records, mask, allocator);
             filtered.into_byte_buffer().aligned(alignment)
         },
         _ => {
@@ -63,7 +72,10 @@ fn filter_records(values: ByteBuffer, byte_width: usize, mask: &MaskValues) -> B
                     values.freeze().into_byte_buffer().aligned(alignment)
                 }
                 Err(values) => {
-                    let mut filtered = BufferMut::with_capacity(mask.true_count() * byte_width);
+                    let mut filtered = BufferMut::with_capacity_in(
+                        mask.true_count() * byte_width,
+                        allocator.clone(),
+                    );
                     mask.bit_buffer().for_each_set_index(|index| {
                         let start = index * byte_width;
                         filtered.extend_from_slice(&values[start..start + byte_width]);

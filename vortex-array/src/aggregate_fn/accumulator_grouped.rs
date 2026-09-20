@@ -7,7 +7,6 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
-use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 use vortex_mask::Mask;
 
@@ -17,6 +16,7 @@ use crate::Columnar;
 use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::aggregate_fn::Accumulator;
+use crate::aggregate_fn::AggregateDTypes;
 use crate::aggregate_fn::AggregateFn;
 use crate::aggregate_fn::AggregateFnRef;
 use crate::aggregate_fn::AggregateFnVTable;
@@ -28,7 +28,7 @@ use crate::arrays::ListViewArray;
 use crate::arrays::fixed_size_list::FixedSizeListArrayExt;
 use crate::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
 use crate::arrays::listview::ListViewArraySlotsExt;
-use crate::builders::builder_with_capacity;
+use crate::builders::builder_with_capacity_in;
 use crate::builtins::ArrayBuiltins;
 use crate::columnar::AnyColumnar;
 use crate::dtype::DType;
@@ -187,12 +187,8 @@ pub struct GroupedAccumulator<V: AggregateFnVTable> {
     options: V::Options,
     /// Type-erased aggregate function used for kernel dispatch.
     aggregate_fn: AggregateFnRef,
-    /// The DType of the input.
-    dtype: DType,
-    /// The DType of the aggregate.
-    return_dtype: DType,
-    /// The DType of the partial accumulator state.
-    partial_dtype: DType,
+    /// The input, partial, and result dtypes lent to every vtable call.
+    dtypes: AggregateDTypes,
     /// The accumulated state for prior batches of groups.
     partials: Vec<ArrayRef>,
 }
@@ -200,28 +196,13 @@ pub struct GroupedAccumulator<V: AggregateFnVTable> {
 impl<V: AggregateFnVTable> GroupedAccumulator<V> {
     pub fn try_new(vtable: V, options: V::Options, dtype: DType) -> VortexResult<Self> {
         let aggregate_fn = AggregateFn::new(vtable.clone(), options.clone()).erased();
-        let return_dtype = vtable.return_dtype(&options, &dtype).ok_or_else(|| {
-            vortex_err!(
-                "Aggregate function {} cannot be applied to dtype {}",
-                vtable.id(),
-                dtype
-            )
-        })?;
-        let partial_dtype = vtable.partial_dtype(&options, &dtype).ok_or_else(|| {
-            vortex_err!(
-                "Aggregate function {} cannot be applied to dtype {}",
-                vtable.id(),
-                dtype
-            )
-        })?;
+        let dtypes = AggregateDTypes::try_new(&vtable, &options, dtype)?;
 
         Ok(Self {
             vtable,
             options,
             aggregate_fn,
-            dtype,
-            return_dtype,
-            partial_dtype,
+            dtypes,
             partials: vec![],
         })
     }
@@ -253,9 +234,9 @@ impl<V: AggregateFnVTable> DynGroupedAccumulator for GroupedAccumulator<V> {
             ),
         };
         vortex_ensure!(
-            elements_dtype.as_ref() == &self.dtype,
+            elements_dtype.as_ref() == &self.dtypes.dtype,
             "Input DType mismatch: expected {}, got {}",
-            self.dtype,
+            self.dtypes.dtype,
             elements_dtype
         );
 
@@ -273,18 +254,23 @@ impl<V: AggregateFnVTable> DynGroupedAccumulator for GroupedAccumulator<V> {
     }
 
     fn flush(&mut self) -> VortexResult<ArrayRef> {
-        let states = std::mem::take(&mut self.partials);
-        Ok(ChunkedArray::try_new(states, self.partial_dtype.clone())?.into_array())
+        let mut states = std::mem::take(&mut self.partials);
+        if states.len() == 1 {
+            return Ok(states.pop().vortex_expect("checked one partial"));
+        }
+        Ok(ChunkedArray::try_new(states, self.dtypes.partial_dtype.clone())?.into_array())
     }
 
     fn finish(&mut self) -> VortexResult<ArrayRef> {
         let states = self.flush()?;
-        let results = self.vtable.finalize(states)?;
+        let results = self
+            .vtable
+            .finalize(self.dtypes.args(&self.options), states)?;
 
         vortex_ensure!(
-            results.dtype() == &self.return_dtype,
+            results.dtype() == &self.dtypes.return_dtype,
             "Return DType mismatch: expected {}, got {}",
-            self.return_dtype,
+            self.dtypes.return_dtype,
             results.dtype()
         );
 
@@ -356,9 +342,10 @@ impl<V: AggregateFnVTable> GroupedAccumulator<V> {
         let mut accumulator = Accumulator::try_new(
             self.vtable.clone(),
             self.options.clone(),
-            self.dtype.clone(),
+            self.dtypes.dtype.clone(),
         )?;
-        let mut states = builder_with_capacity(&self.partial_dtype, grouped.len());
+        let mut states =
+            builder_with_capacity_in(&self.dtypes.partial_dtype, grouped.len(), ctx.allocator());
         let group_ranges = grouped.group_ranges(ctx)?;
         let group_validity = grouped.group_validity(ctx)?;
 
@@ -377,9 +364,9 @@ impl<V: AggregateFnVTable> GroupedAccumulator<V> {
 
     fn push_result(&mut self, state: ArrayRef) -> VortexResult<()> {
         vortex_ensure!(
-            state.dtype() == &self.partial_dtype,
+            state.dtype() == &self.dtypes.partial_dtype,
             "State DType mismatch: expected {}, got {}",
-            self.partial_dtype,
+            self.dtypes.partial_dtype,
             state.dtype()
         );
         self.partials.push(state);
@@ -416,5 +403,70 @@ fn fixed_size_list_group_ranges(groups: &FixedSizeListArray) -> GroupRanges {
     GroupRanges::FixedSizeList {
         len: groups.len(),
         size: groups.list_size() as usize,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vortex_error::VortexResult;
+
+    use crate::ArrayRef;
+    use crate::IntoArray;
+    use crate::aggregate_fn::DynGroupedAccumulator;
+    use crate::aggregate_fn::GroupedAccumulator;
+    use crate::aggregate_fn::NumericalAggregateOpts;
+    use crate::aggregate_fn::fns::count::Count;
+    use crate::arrays::Chunked;
+    use crate::arrays::PrimitiveArray;
+    use crate::dtype::DType;
+    use crate::dtype::Nullability::NonNullable;
+    use crate::dtype::PType;
+
+    fn accumulator() -> VortexResult<GroupedAccumulator<Count>> {
+        GroupedAccumulator::try_new(
+            Count,
+            NumericalAggregateOpts::default(),
+            DType::Primitive(PType::I32, NonNullable),
+        )
+    }
+
+    fn state(values: impl IntoIterator<Item = u64>) -> ArrayRef {
+        PrimitiveArray::from_iter(values).into_array()
+    }
+
+    #[test]
+    fn test_flush_single_partial_returns_original_array() -> VortexResult<()> {
+        let mut accumulator = accumulator()?;
+        let state = state([1, 2, 3]);
+        accumulator.push_result(state.clone())?;
+
+        let flushed = accumulator.flush()?;
+
+        assert!(ArrayRef::ptr_eq(&flushed, &state));
+        Ok(())
+    }
+
+    #[test]
+    fn test_flush_multiple_partials_returns_chunked_array() -> VortexResult<()> {
+        let mut accumulator = accumulator()?;
+        accumulator.push_result(state([1, 2]))?;
+        accumulator.push_result(state([3, 4]))?;
+
+        let flushed = accumulator.flush()?;
+
+        assert!(flushed.is::<Chunked>());
+        assert_eq!(flushed.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn test_flush_without_partials_returns_empty_chunked_array() -> VortexResult<()> {
+        let mut accumulator = accumulator()?;
+
+        let flushed = accumulator.flush()?;
+
+        assert!(flushed.is::<Chunked>());
+        assert!(flushed.is_empty());
+        Ok(())
     }
 }

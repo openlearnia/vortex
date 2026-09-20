@@ -21,6 +21,7 @@ use vortex::array::dtype::extension::ExtDType;
 use vortex::array::validity::Validity;
 use vortex::buffer::BitBuffer;
 use vortex::buffer::Buffer;
+use vortex::buffer::BufferAllocatorRef;
 use vortex::buffer::BufferMut;
 use vortex::dtype::DType;
 use vortex::dtype::DecimalDType;
@@ -90,6 +91,13 @@ fn vector_as_slice<T: NativePType>(vector: &VectorRef, len: usize) -> ArrayRef {
     .into_array()
 }
 
+fn vector_i128_values(vector: &VectorRef, len: usize) -> impl Iterator<Item = i128> {
+    let base = unsafe { crate::cpp::duckdb_vector_get_data(vector.as_ptr()) }.cast::<i128>();
+    // In batch copy, columns are 8 byte aligned, so reading vector's values
+    // as &[i128] is UB. Read data unaligned specifically
+    (0..len).map(move |i| unsafe { base.add(i).read_unaligned() })
+}
+
 fn vector_mapped<T, P: NativePType, F: Fn(&T) -> P>(
     vector: &VectorRef,
     len: usize,
@@ -108,7 +116,8 @@ fn vector_as_string_blob(vector: &VectorRef, len: usize, dtype: DType) -> ArrayR
     let data = vector.as_slice_with_len::<duckdb_string_t>(len);
     let validity = vector.validity_ref(len);
 
-    let mut builder = VarBinViewBuilder::with_capacity(dtype, len);
+    let mut builder =
+        VarBinViewBuilder::with_capacity_in(dtype, len, BufferAllocatorRef::statically_allocated());
 
     for (i, s) in data.iter().enumerate() {
         if validity.is_valid(i) {
@@ -510,12 +519,34 @@ pub fn flat_vector_to_vortex(vector: &VectorRef, len: usize) -> VortexResult<Arr
                     DecimalArray::try_new(Buffer::copy_from(data), decimal_dtype, validity)
                 }
                 DecimalType::I128 => {
-                    let data = vector.as_slice_with_len::<i128>(len);
-                    DecimalArray::try_new(Buffer::copy_from(data), decimal_dtype, validity)
+                    let data = Buffer::from_iter(vector_i128_values(vector, len));
+                    DecimalArray::try_new(data, decimal_dtype, validity)
                 }
                 _ => vortex_bail!("Unsupported decimal precision: {precision}"),
             }
             .map(|a| a.into_array())
+        }
+        DUCKDB_TYPE::DUCKDB_TYPE_UUID => {
+            let mut bytes = BufferMut::<u8>::with_capacity(len * 16);
+            for v in vector_i128_values(vector, len) {
+                let be = (v as u128) ^ (1u128 << 127);
+                bytes.extend_from_slice(&be.to_be_bytes());
+            }
+
+            let storage = FixedSizeListArray::try_new(
+                PrimitiveArray::new(bytes.freeze(), Validity::NonNullable).into_array(),
+                16,
+                vector.validity_ref(len).to_validity(),
+                len,
+            )?;
+            let ext_dtype = ExtDType::<Uuid>::try_with_vtable(
+                Uuid,
+                UuidMetadata::default(),
+                storage.dtype().clone(),
+            )?
+            .erased();
+
+            Ok(ExtensionArray::try_new(ext_dtype, storage.into_array())?.into_array())
         }
         DUCKDB_TYPE::DUCKDB_TYPE_ARRAY => {
             let array_elem_size = vector.logical_type().array_type_array_size();

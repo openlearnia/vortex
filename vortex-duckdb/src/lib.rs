@@ -13,8 +13,11 @@ use std::sync::OnceLock;
 use vortex::VortexSessionDefault;
 use vortex::array::dtype::session::DTypeSessionExt;
 use vortex::cloud::Registry;
+use vortex::editions::CORE_2026_08_3;
+use vortex::editions::EditionSessionExt;
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
+use vortex::error::vortex_err;
 use vortex::io::runtime::BlockingRuntime;
 use vortex::io::runtime::current::CurrentThreadRuntime;
 use vortex::io::session::RuntimeSessionExt;
@@ -28,8 +31,11 @@ mod convert;
 pub mod duckdb;
 mod exporter;
 mod ffi;
+mod exporter;
+mod ffi;
+mod file_reader;
+// DuckLake integration: footer-only metadata for ducklake_add_data_files.
 mod full_metadata;
-mod multi_file;
 mod projection;
 mod table_function;
 
@@ -52,6 +58,10 @@ static RUNTIME: LazyLock<CurrentThreadRuntime> = LazyLock::new(CurrentThreadRunt
 static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
 static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let session = VortexSession::default().with_handle(RUNTIME.handle());
+    session
+        .enable_edition(CORE_2026_08_3)
+        .map_err(|error| vortex_err!("{error}"))
+        .vortex_expect("DuckDB-supported draft core edition is registered");
     vortex_spatial::initialize(&session);
     session.dtypes().register(convert::ext_types::DuckInterval);
     session.dtypes().register(convert::ext_types::DuckEnum);
@@ -83,6 +93,7 @@ fn init_tracing() {
 /// separately (e.g., before creating connections), call `register_extension_options` first.
 pub fn initialize(db: &DatabaseRef) -> VortexResult<()> {
     db.register_table_functions()?;
+    db.register_version_function(env!("VORTEX_VERSION"))?;
     db.register_optimizer_extension()?;
     db.register_copy_function()
 }

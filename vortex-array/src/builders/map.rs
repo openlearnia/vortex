@@ -4,9 +4,9 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use vortex_buffer::BufferAllocatorRef;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
-use vortex_mask::Mask;
 
 use crate::ArrayRef;
 use crate::Canonical;
@@ -40,17 +40,44 @@ pub struct MapBuilder<O: OffsetBuilderPType, S: OffsetBuilderPType> {
 
 impl<O: OffsetBuilderPType, S: OffsetBuilderPType> MapBuilder<O, S> {
     /// Creates a map builder with the default capacity.
+    #[deprecated(note = "use `new_in` with an explicit allocator")]
     pub fn new(map_dtype: MapDType, nullability: Nullability) -> Self {
-        Self::with_capacity(map_dtype, nullability, DEFAULT_BUILDER_CAPACITY)
+        Self::new_in(map_dtype, nullability, BufferAllocatorRef::static_ref())
+    }
+
+    /// Creates a map builder with the default capacity using `allocator`.
+    pub fn new_in(
+        map_dtype: MapDType,
+        nullability: Nullability,
+        allocator: &BufferAllocatorRef,
+    ) -> Self {
+        Self::with_capacity_in(map_dtype, nullability, DEFAULT_BUILDER_CAPACITY, allocator)
     }
 
     /// Creates a map builder with space for `capacity` map rows.
+    #[deprecated(note = "use `with_capacity_in` with an explicit allocator")]
     pub fn with_capacity(map_dtype: MapDType, nullability: Nullability, capacity: usize) -> Self {
-        let entries_builder = ListViewBuilder::with_capacity(
+        Self::with_capacity_in(
+            map_dtype,
+            nullability,
+            capacity,
+            BufferAllocatorRef::static_ref(),
+        )
+    }
+
+    /// Creates a map builder with space for `capacity` rows using `allocator`.
+    pub fn with_capacity_in(
+        map_dtype: MapDType,
+        nullability: Nullability,
+        capacity: usize,
+        allocator: &BufferAllocatorRef,
+    ) -> Self {
+        let entries_builder = ListViewBuilder::with_capacity_in(
             Arc::new(map_dtype.entries_dtype()),
             nullability,
             capacity.saturating_mul(2),
             capacity,
+            allocator,
         );
         let dtype = DType::Map(map_dtype.clone(), nullability);
         Self {
@@ -145,10 +172,6 @@ impl<O: OffsetBuilderPType, S: OffsetBuilderPType> ArrayBuilder for MapBuilder<O
 
     fn reserve_exact(&mut self, additional: usize) {
         self.entries_builder.reserve_exact(additional);
-    }
-
-    unsafe fn set_validity_unchecked(&mut self, validity: Mask) {
-        unsafe { self.entries_builder.set_validity_unchecked(validity) };
     }
 
     fn finish(&mut self) -> ArrayRef {

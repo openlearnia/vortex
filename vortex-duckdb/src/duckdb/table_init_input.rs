@@ -32,16 +32,15 @@ impl<'a> TableInitInput<'a> {
         unsafe { std::slice::from_raw_parts(self.input.column_ids, self.input.column_ids_count) }
     }
 
-    pub fn projection_ids(&self) -> Option<&[u64]> {
-        // Passed pointer is std::vector's .data(). However, C++ doesn't
-        // guarantee an empty vector's pointer is nullptr so we need to check
-        // both conditions
-        if self.input.projection_ids.is_null() || self.input.projection_ids_count == 0 {
-            return None;
+    pub fn projection_ids(&self) -> &[u64] {
+        if self.input.projection_ids_count == 0 {
+            // from_raw_parts requires a non-null pointer. C++'s empty vector
+            // may have a null pointer.
+            return &[];
         }
-        Some(unsafe {
+        unsafe {
             std::slice::from_raw_parts(self.input.projection_ids, self.input.projection_ids_count)
-        })
+        }
     }
 
     /// Returns the table filter set for the table function.

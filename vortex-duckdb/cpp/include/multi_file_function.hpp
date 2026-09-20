@@ -20,15 +20,18 @@ struct VortexMultiFileBindData : public TableFunctionData {
 };
 
 struct VortexMultiFileGlobalState : public GlobalTableFunctionState {
+	//! Rust scan GlobalState shared by all Vortex locals of this multi file scan.
+	unique_ptr<CData> ffi_global;
+	//! First file's Rust BindState; needed to create the per-thread local states.
+	const void *ffi_bind = nullptr;
 	//! Vortex locals share one thread-safe iterator for the current file.
-	shared_ptr<GlobalTableFunctionState> vortex_global;
 	idx_t scans_assigned = 0;
 	idx_t max_scans = 1;
 };
 
 struct VortexMultiFileLocalState : public LocalTableFunctionState {
-	shared_ptr<GlobalTableFunctionState> vortex_global;
-	unique_ptr<LocalTableFunctionState> vortex_local;
+	//! Per-thread Rust scan LocalState.
+	unique_ptr<CData> ffi_local;
 	idx_t file_row_offset = 0;
 	SelectionVector deletion_sel;
 	DataChunk vortex_chunk;
@@ -59,7 +62,10 @@ private:
 	vector<column_t> BuildVortexColumnIds(VortexMultiFileLocalState &lstate, vector<LogicalType> &types);
 
 	ClientContext &context;
-	unique_ptr<FunctionData> bind_data;
+	//! Opened Vortex file (Rust OpenFileReader).
+	unique_ptr<CData> ffi_file;
+	//! Rust BindState created from the file's footer/schema.
+	unique_ptr<CData> ffi_bind;
 	idx_t schema_column_count = 0;
 	set<idx_t> file_row_number_cols;
 };

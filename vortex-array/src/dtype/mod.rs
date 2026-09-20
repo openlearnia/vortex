@@ -16,7 +16,6 @@
 #[cfg(feature = "arbitrary")]
 mod arbitrary;
 mod bigint;
-mod coercion;
 mod decimal;
 mod dtype_impl;
 pub mod extension;
@@ -201,7 +200,7 @@ pub mod proto {
     //!
     //! This module contains the code to serialize and deserialize DTypes to and from protocol buffers.
 
-    pub use vortex_proto::dtype;
+    pub use crate::proto::dtype;
 }
 
 pub mod flatbuffers {
@@ -209,7 +208,7 @@ pub mod flatbuffers {
     //!
     //! This module contains the code to serialize and deserialize DTypes to and from flatbuffers.
 
-    pub use vortex_flatbuffers::dtype::*;
+    pub use crate::flatbuffers::dtype::*;
 }
 
 #[cfg(test)]

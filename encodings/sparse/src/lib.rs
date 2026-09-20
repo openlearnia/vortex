@@ -48,7 +48,6 @@ use vortex_array::validity::Validity;
 use vortex_array::vtable::VTable;
 use vortex_array::vtable::ValidityVTable;
 use vortex_buffer::Buffer;
-use vortex_buffer::ByteBufferMut;
 use vortex_error::VortexExpect as _;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -217,7 +216,7 @@ impl VTable for Sparse {
         match idx {
             0 => {
                 let fill_value_buffer =
-                    ScalarValue::to_proto_bytes::<ByteBufferMut>(array.fill_value.value()).freeze();
+                    ScalarValue::to_proto_bytes::<Vec<u8>>(array.fill_value.value()).into();
                 BufferHandle::new_host(fill_value_buffer)
             }
             _ => vortex_panic!("SparseArray buffer index {idx} out of bounds"),
@@ -958,7 +957,11 @@ mod test {
             Some("last"),
         ])
         .into_array();
-        let mut builder = VarBinBuilder::<i32>::with_capacity(array.dtype().clone(), array.len());
+        let mut builder = VarBinBuilder::<i32>::with_capacity_in(
+            array.dtype().clone(),
+            array.len(),
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
         array.append_to_builder(&mut builder, &mut ctx).unwrap();
         assert_arrays_eq!(builder.finish_into_varbin(), expected, &mut ctx);
     }
@@ -975,7 +978,11 @@ mod test {
         )
         .unwrap();
         let expected = VarBinViewArray::from_iter_str(["fill", "second"]).into_array();
-        let mut builder = VarBinBuilder::<i32>::with_capacity(array.dtype().clone(), array.len());
+        let mut builder = VarBinBuilder::<i32>::with_capacity_in(
+            array.dtype().clone(),
+            array.len(),
+            vortex_buffer::BufferAllocatorRef::static_ref(),
+        );
         array.append_to_builder(&mut builder, &mut ctx).unwrap();
         assert_arrays_eq!(builder.finish_into_varbin(), expected, &mut ctx);
     }

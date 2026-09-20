@@ -197,7 +197,7 @@ impl CudaExecutionCtx {
     ///
     /// # Arguments
     ///
-    /// * `module_name` - Name of the module (`kernels/{module_name}.ptx`)
+    /// * `module_name` - Kernel source name without the `.cu` extension
     /// * `ptypes` - List of ptype strings for the kernel name
     ///
     /// # Errors
@@ -222,7 +222,7 @@ impl CudaExecutionCtx {
     ///
     /// # Arguments
     ///
-    /// * `module_name` - Name of the module (`kernels/{module_name}.ptx`)
+    /// * `module_name` - Kernel source name without the `.cu` extension
     /// * `type_suffixes` - List of type suffix strings for the kernel name
     ///
     /// # Errors
@@ -313,7 +313,6 @@ impl CudaExecutionCtx {
     }
 
     /// Returns the Vortex session backing this CUDA execution context.
-    #[cfg(feature = "unstable_encodings")]
     pub(crate) fn session(&self) -> &vortex::session::VortexSession {
         self.ctx.session()
     }

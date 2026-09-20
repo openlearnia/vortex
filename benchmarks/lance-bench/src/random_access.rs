@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use lance::Dataset;
 use lance::dataset::ProjectionRequest;
 use lance::dataset::WriteParams;
-use lance_encoding::version::LanceFileVersion;
+use lance_file::version::LanceFileVersion;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use vortex_bench::Format;
 use vortex_bench::datasets::feature_vectors;
@@ -114,8 +114,7 @@ impl RandomAccessor for LanceRandomAccessor {
     }
 
     async fn take(&self, indices: &[u64]) -> anyhow::Result<RandomAccessorRet> {
-        Ok(RandomAccessorRet::RecordBatch(
-            self.dataset.take(indices, self.projection.clone()).await?,
-        ))
+        let batch = self.dataset.take(indices, self.projection.clone()).await?;
+        Ok(RandomAccessorRet::Native(Box::new(batch)))
     }
 }

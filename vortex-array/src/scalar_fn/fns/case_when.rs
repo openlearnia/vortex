@@ -20,7 +20,6 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_mask::AllOr;
 use vortex_mask::Mask;
-use vortex_proto::expr as pb;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
@@ -31,11 +30,12 @@ use crate::arrays::BoolArray;
 use crate::arrays::ConstantArray;
 use crate::arrays::bool::BoolArrayExt;
 use crate::builders::ArrayBuilder;
-use crate::builders::builder_with_capacity;
+use crate::builders::builder_with_capacity_in;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::expr::Expression;
 use crate::expr::display::ExprDisplay;
+use crate::proto::expr as pb;
 use crate::scalar::Scalar;
 use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
@@ -306,8 +306,8 @@ impl ScalarFnVTable for CaseWhen {
         false
     }
 
-    fn is_fallible(&self, _options: &Self::Options) -> bool {
-        false
+    fn is_infallible(&self, _options: &Self::Options) -> bool {
+        true
     }
 }
 
@@ -354,7 +354,7 @@ fn merge_case_branches(
         return else_value.cast(output_dtype);
     }
 
-    let builder = builder_with_capacity(&output_dtype, else_value.len());
+    let builder = builder_with_capacity_in(&output_dtype, else_value.len(), ctx.allocator());
 
     let fragmented = spans.len() > else_value.len() / SLICE_CROSSOVER_RUN_LEN;
     if fragmented {

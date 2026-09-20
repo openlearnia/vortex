@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 #include "multi_file_function.hpp"
+#include "multi_file_reader.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
@@ -156,21 +157,36 @@ void TryApplyDuckLakeFieldIds(const string &path, vector<MultiFileColumnDefiniti
 	free(bytes);
 }
 
-unique_ptr<FunctionData> BindVortexFile(ClientContext &context, const string &path, vector<LogicalType> &types,
-                                        vector<string> &names, const string &encryption_key) {
-	vector<Value> inputs {Value(path)};
-	// Optional second positional param: raw AES-GCM key bytes (DuckLake OpenFileInfo).
-	if (!encryption_key.empty()) {
-		inputs.push_back(Value::BLOB_RAW(encryption_key));
+unique_ptr<CData> OpenVortexFile(const string &path, const string &encryption_key) {
+	duckdb_vx_error error = nullptr;
+	unique_ptr<CData> ffi_file;
+	if (encryption_key.empty()) {
+		ffi_file.reset(reinterpret_cast<CData *>(duckdb_reader_open(path.c_str(), path.size(), &error)));
+	} else {
+		ffi_file.reset(reinterpret_cast<CData *>(duckdb_reader_open_with_key(
+		    path.c_str(), path.size(),
+		    reinterpret_cast<const uint8_t *>(encryption_key.data()), encryption_key.size(), &error)));
 	}
-	named_parameter_map_t named_parameters;
-	vector<LogicalType> input_table_types;
-	vector<string> input_table_names;
-	TableFunction dummy_function;
-	TableFunctionRef dummy_ref;
-	TableFunctionBindInput bind_input(inputs, named_parameters, input_table_types, input_table_names, nullptr, nullptr,
-	                                  dummy_function, dummy_ref);
-	return duckdb_vx_table_function_bind(context, bind_input, types, names);
+	if (error) {
+		throw IOException(IntoErrString(error));
+	}
+	return ffi_file;
+}
+
+void BindVortexFile(ClientContext &context, const string &path, vector<LogicalType> &types,
+                    vector<string> &names, const string &encryption_key, unique_ptr<CData> &ffi_file,
+                    unique_ptr<CData> &ffi_bind) {
+	ffi_file = OpenVortexFile(path, encryption_key);
+
+	// Bind the scan schema from the opened file, the way read_vortex does.
+	VortexBindResult result {types, names};
+	duckdb_vx_error error = nullptr;
+	duckdb_bind_result ffi_result = reinterpret_cast<duckdb_bind_result>(&result);
+	const duckdb_vx_data ffi_bind_data = duckdb_reader_bind(ffi_file->DataPtr(), ffi_result, &error);
+	if (error) {
+		throw BinderException(IntoErrString(error));
+	}
+	ffi_bind.reset(reinterpret_cast<CData *>(ffi_bind_data));
 }
 
 string EncryptionKeyFromOpenFile(const OpenFileInfo &file) {
@@ -209,19 +225,24 @@ VortexFileReader::VortexFileReader(ClientContext &context_p, OpenFileInfo file_p
 	if (encryption_key.empty()) {
 		encryption_key = EncryptionKeyFromOpenFile(file);
 	}
-	bind_data = BindVortexFile(context, file.path, types, names, encryption_key);
+	BindVortexFile(context, file.path, types, names, encryption_key, ffi_file, ffi_bind);
 	schema_column_count = names.size();
 	columns = ColumnsFromVortexNamesAndTypes(names, types);
 	TryApplyDuckLakeFieldIds(file.path, columns);
 }
 
-unique_ptr<BaseStatistics> VortexFileReader::GetStatistics(ClientContext &context_p, const string &name) {
+unique_ptr<BaseStatistics> VortexFileReader::GetStatistics(ClientContext &, const string &name) {
 	for (idx_t column_index = 0; column_index < schema_column_count; column_index++) {
 		if (columns[column_index].name == name) {
 			if (columns[column_index].type.id() == LogicalTypeId::VARIANT) {
 				return nullptr;
 			}
-			return vortex_table_statistics(context_p, bind_data.get(), column_index);
+			duckdb_column_statistics statistics = {};
+			if (!duckdb_reader_get_statistics(ffi_file->DataPtr(), ffi_bind->DataPtr(), name.c_str(), name.size(),
+			                                  &statistics)) {
+				return nullptr;
+			}
+			return to_duckdb_statistics(statistics);
 		}
 	}
 	return nullptr;
@@ -273,14 +294,13 @@ bool VortexFileReader::TryInitializeScan(ClientContext &context, GlobalTableFunc
 	if (lstate.assigned_reader == this) {
 		return false;
 	}
-	if (gstate.scans_assigned >= gstate.max_scans && gstate.vortex_global) {
+	if (gstate.scans_assigned >= gstate.max_scans && gstate.ffi_global) {
 		return false;
 	}
 
 	lstate.file_row_offset = 0;
 	lstate.output_to_vortex.clear();
-	lstate.vortex_global.reset();
-	lstate.vortex_local.reset();
+	lstate.ffi_local.reset();
 
 	vector<LogicalType> vortex_types;
 	auto vortex_column_ids = BuildVortexColumnIds(lstate, vortex_types);
@@ -291,19 +311,41 @@ bool VortexFileReader::TryInitializeScan(ClientContext &context, GlobalTableFunc
 	// Derived virtual columns likewise need their expressions evaluated before filtering.
 	optional_ptr<TableFilterSet> filters_for_vortex =
 	    deletion_filter || !expression_map.empty() ? nullptr : filters.get();
-	TableFunctionInitInput init_input(bind_data.get(), std::move(vortex_column_ids), empty_projection,
-	                                  filters_for_vortex);
 
-	if (!gstate.vortex_global) {
-		gstate.vortex_global = vortex_table_init_global(context, init_input);
+	if (!gstate.ffi_global) {
+		// First reader of this scan creates the shared Rust global state.
+		const duckdb_vx_tfunc_init_input ffi_input = {
+		    .bind_data = ffi_bind->DataPtr(),
+		    .column_ids = vortex_column_ids.data(),
+		    .column_ids_count = vortex_column_ids.size(),
+		    .projection_ids = empty_projection.data(),
+		    .projection_ids_count = empty_projection.size(),
+		    .filters = reinterpret_cast<duckdb_vx_table_filter_set>(filters_for_vortex.get()),
+		    .client_context = reinterpret_cast<duckdb_client_context>(&context),
+		};
+		duckdb_vx_error error = nullptr;
+		gstate.ffi_global.reset(reinterpret_cast<CData *>(duckdb_table_function_init_global(&ffi_input, &error)));
+		if (error) {
+			throw BinderException(IntoErrString(error));
+		}
+		gstate.ffi_bind = ffi_bind->DataPtr();
 		gstate.max_scans =
 		    deletion_filter ? 1 : NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
 	}
-	lstate.vortex_global = gstate.vortex_global;
-	lstate.vortex_local = vortex_table_init_local(init_input, lstate.vortex_global.get());
-	gstate.scans_assigned++;
+	if (!lstate.ffi_local) {
+		lstate.ffi_local.reset(reinterpret_cast<CData *>(
+		    duckdb_table_function_init_local(gstate.ffi_bind, gstate.ffi_global->DataPtr())));
+	}
 	lstate.assigned_reader = this;
 	lstate.prepared = true;
+	// Attach this file to the thread's Rust local state; a false return means
+	// the file is pruned (e.g. by footer statistics) and has no work here.
+	if (!duckdb_reader_try_initialize_scan(lstate.ffi_local->DataPtr(), ffi_file->DataPtr())) {
+		lstate.assigned_reader = nullptr;
+		lstate.prepared = false;
+		return false;
+	}
+	gstate.scans_assigned++;
 	return true;
 }
 
@@ -312,16 +354,21 @@ void VortexFileReader::PrepareScan(ClientContext &, GlobalTableFunctionState &,
 	D_ASSERT(lstate_p.Cast<VortexMultiFileLocalState>().prepared);
 }
 
-AsyncResult VortexFileReader::Scan(ClientContext &context_p, GlobalTableFunctionState &,
+AsyncResult VortexFileReader::Scan(ClientContext &context_p, GlobalTableFunctionState &gstate_p,
                                    LocalTableFunctionState &lstate_p, DataChunk &chunk) {
+	auto &gstate = gstate_p.Cast<VortexMultiFileGlobalState>();
 	auto &lstate = lstate_p.Cast<VortexMultiFileLocalState>();
 	D_ASSERT(lstate.prepared);
-	D_ASSERT(lstate.vortex_global);
-	D_ASSERT(lstate.vortex_local);
+	D_ASSERT(lstate.ffi_local);
 
-	TableFunctionInput input(bind_data.get(), lstate.vortex_local.get(), lstate.vortex_global.get());
+	duckdb_vx_error error = nullptr;
 	lstate.vortex_chunk.Reset();
-	vortex_table_scan(context_p, input, lstate.vortex_chunk);
+	const bool has_more_data =
+	    duckdb_reader_scan(ffi_file->DataPtr(), gstate.ffi_global->DataPtr(), lstate.ffi_local->DataPtr(),
+	                       reinterpret_cast<duckdb_data_chunk>(&lstate.vortex_chunk), &error);
+	if (error) {
+		throw InvalidInputException(IntoErrString(error));
+	}
 	if (lstate.vortex_chunk.size() == 0) {
 		return SourceResultType::FINISHED;
 	}
@@ -385,12 +432,13 @@ AsyncResult VortexFileReader::Scan(ClientContext &context_p, GlobalTableFunction
 		chunk.data[i].Reference(evaluated);
 	}
 	lstate.file_row_offset += scanned;
-	return SourceResultType::HAVE_MORE_OUTPUT;
+	return has_more_data ? SourceResultType::HAVE_MORE_OUTPUT : SourceResultType::FINISHED;
 }
 
 void VortexFileReader::FinishFile(ClientContext &, GlobalTableFunctionState &gstate_p) {
 	auto &gstate = gstate_p.Cast<VortexMultiFileGlobalState>();
-	gstate.vortex_global.reset();
+	gstate.ffi_global.reset();
+	gstate.ffi_bind = nullptr;
 	gstate.scans_assigned = 0;
 	gstate.max_scans = 1;
 }

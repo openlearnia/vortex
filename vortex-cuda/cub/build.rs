@@ -17,7 +17,20 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    // Keep CUB's architecture selection in sync with the embedded kernels.
+    for name in [
+        "CUDA_PATH",
+        "PATH",
+        "VORTEX_CUDA_ARCH_FLAGS",
+        "VORTEX_CUDA_HOST_COMPILER",
+        "CUDA_VISIBLE_DEVICES",
+        "CUDA_DEVICE_ORDER",
+        "NVCC_PREPEND_FLAGS",
+        "NVCC_APPEND_FLAGS",
+        "NVCC_CCBIN",
+    ] {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let kernels_dir = manifest_dir.join("kernels");
@@ -56,8 +69,18 @@ fn is_cuda_available() -> bool {
 
 fn compile_shared_library(kernel_dir: &Path, sources: &[PathBuf], out_dir: &Path) {
     let lib_path = out_dir.join("libvortex_cub.so");
+    let architecture_flags =
+        env::var("VORTEX_CUDA_ARCH_FLAGS").unwrap_or_else(|_| "-arch=native".to_owned());
     let mut cmd = Command::new("nvcc");
-    cmd.args(["-std=c++20", "-arch=native"]);
+    cmd.arg("-std=c++20")
+        .args(architecture_flags.split_whitespace());
+    if let Some(host_compiler) =
+        env::var_os("VORTEX_CUDA_HOST_COMPILER").filter(|path| !path.is_empty())
+    {
+        // Despite its name, --compiler-bindir accepts a compiler executable path.
+        // It is used to honor CMake's host compiler choice; CXX alone does not reliably control NVCC.
+        cmd.arg("--compiler-bindir").arg(host_compiler);
+    }
 
     if env::var("PROFILE").unwrap() == "debug" {
         cmd.args(["-O0", "-g", "-G", "-lineinfo"]);
@@ -102,6 +125,7 @@ fn generate_rust_bindings(kernels_dir: &Path, out_dir: &Path) {
         .allowlist_function("filter_bytemask_.*")
         .allowlist_function("filter_bitmask_.*")
         .allowlist_function("scan_exclusive_sum_.*")
+        .allowlist_function("onpair_.*")
         // Allow CUDA types
         .allowlist_type("cudaError_t")
         // Blocklist cudaStream_t and define it manually as an opaque pointer

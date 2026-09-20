@@ -73,7 +73,7 @@ impl SegmentSink for BufferedSegmentSink {
                 .unwrap_or_else(Alignment::none);
 
             let byte_offset = self.byte_offset.load(Ordering::Relaxed);
-            let padding = byte_offset.next_multiple_of(*alignment as u64) - byte_offset;
+            let padding = byte_offset.next_multiple_of(alignment.as_usize() as u64) - byte_offset;
             let offset = byte_offset + padding;
 
             let (out_buffers, length, encryption) = if let Some(key) = &self.encryption_key {
