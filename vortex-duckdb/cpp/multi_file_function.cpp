@@ -18,6 +18,7 @@
 
 #include "error.hpp"
 #include "vortex_duckdb.h"
+#include "vortex.h"
 
 #include <cstdlib>
 
