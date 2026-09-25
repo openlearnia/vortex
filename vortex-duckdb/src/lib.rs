@@ -14,6 +14,7 @@ use vortex::VortexSessionDefault;
 use vortex::array::dtype::session::DTypeSessionExt;
 use vortex::cloud::Registry;
 use vortex::editions::CORE_2026_08_3;
+use vortex::editions::EditionInclusion;
 use vortex::editions::EditionSessionExt;
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
@@ -29,8 +30,6 @@ use crate::duckdb::DatabaseRef;
 mod column_statistics;
 mod convert;
 pub mod duckdb;
-mod exporter;
-mod ffi;
 mod exporter;
 mod ffi;
 mod file_reader;
@@ -71,6 +70,24 @@ static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     session.dtypes().register(convert::ext_types::DuckUHugeInt);
     session.dtypes().register(convert::ext_types::DuckVariant);
     session.dtypes().register(convert::ext_types::DuckTimeTz);
+    // The file writer rejects extension dtypes outside the enabled editions. The DuckDB
+    // extension dtypes are declared into the enabled core edition so writes stay permitted.
+    for ext_id in [
+        convert::ext_types::INTERVAL_EXT_ID,
+        convert::ext_types::ENUM_EXT_ID,
+        convert::ext_types::BIT_EXT_ID,
+        convert::ext_types::BIGNUM_EXT_ID,
+        convert::ext_types::HUGEINT_EXT_ID,
+        convert::ext_types::UHUGEINT_EXT_ID,
+        convert::ext_types::VARIANT_EXT_ID,
+        convert::ext_types::TIME_TZ_EXT_ID,
+    ] {
+        session
+            .editions()
+            .declare_inclusion(EditionInclusion::dtype(&ext_id, CORE_2026_08_3))
+            .map_err(|error| vortex_err!("{error}"))
+            .vortex_expect("DuckDB extension dtype is a valid edition inclusion");
+    }
     session
 });
 

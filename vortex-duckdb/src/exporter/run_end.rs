@@ -3,7 +3,6 @@
 
 use std::marker::PhantomData;
 
-use vortex::array::ArrayRef;
 use vortex::array::ExecutionCtx;
 use vortex::array::IntoArray;
 use vortex::array::arrays::PrimitiveArray;
@@ -17,7 +16,6 @@ use vortex::encodings::runend::RunEndArraySlotsExt;
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 
-use crate::convert::ToDuckDBScalar;
 use crate::duckdb::ReusableDict;
 use crate::duckdb::SelectionVector;
 use crate::duckdb::VectorRef;
@@ -31,7 +29,6 @@ use crate::exporter::canonical;
 struct RunEndExporter<E: IntegerPType> {
     ends: PrimitiveArray,
     ends_type: PhantomData<E>,
-    values: ArrayRef,
     values_dict: ReusableDict,
     run_end_offset: usize,
 }
@@ -52,13 +49,12 @@ pub(crate) fn new_exporter_with_flatten(
     let ends = array.ends().clone();
     let values = array.values().clone();
     let ends = ends.execute::<PrimitiveArray>(ctx)?;
-    let values_dict = cached_values_dict(values.clone(), cache, ctx)?;
+    let values_dict = cached_values_dict(values, cache, ctx)?;
 
     match_each_integer_ptype!(ends.ptype(), |E| {
         Ok(Box::new(RunEndExporter {
             ends,
             ends_type: PhantomData::<E>,
-            values,
             values_dict,
             run_end_offset: offset,
         }))
@@ -71,7 +67,7 @@ impl<E: IntegerPType> ColumnExporter for RunEndExporter<E> {
         offset: usize,
         len: usize,
         vector: &mut VectorRef,
-        ctx: &mut ExecutionCtx,
+        _ctx: &mut ExecutionCtx,
     ) -> VortexResult<()> {
         let ends_slice = self.ends.as_slice::<E>();
 
@@ -92,11 +88,14 @@ impl<E: IntegerPType> ColumnExporter for RunEndExporter<E> {
             .to_ends_index(ends_slice.len());
 
         if start_run_idx == end_run_idx {
-            // NOTE(ngates): would be great if we could just export and set type == CONSTANT
-            // self.values_exporter.export(start_run_idx, 1, vector, cache);
-            let constant = self.values.execute_scalar(start_run_idx, ctx)?;
-            let value = constant.try_to_duckdb_scalar()?;
-            vector.reference_value(&value);
+            // Export through the reusable dictionary so single-run slices keep
+            // real values for extension dtypes without scalar conversion.
+            let mut sel_vec = SelectionVector::with_capacity(len);
+            let sel_vec_slice = unsafe { sel_vec.as_slice_mut(len) };
+            sel_vec_slice.fill(
+                u32::try_from(start_run_idx).vortex_expect("run index exceeds u32"),
+            );
+            vector.reuse_dictionary(&self.values_dict, &sel_vec, len);
             return Ok(());
         }
 
@@ -119,7 +118,7 @@ impl<E: IntegerPType> ColumnExporter for RunEndExporter<E> {
         }
         debug_assert!(sel_vec_slice.is_empty());
 
-        vector.reuse_dictionary(&self.values_dict, &sel_vec);
+        vector.reuse_dictionary(&self.values_dict, &sel_vec, len);
         Ok(())
     }
 }

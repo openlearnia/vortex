@@ -156,6 +156,10 @@ impl FromLogicalType for DType {
             DUCKDB_TYPE::DUCKDB_TYPE_TIMESTAMP_NS => {
                 DType::Extension(Timestamp::new(TimeUnit::Nanoseconds, nullability).erased())
             }
+            DUCKDB_TYPE::DUCKDB_TYPE_TIMESTAMP_TZ_NS => DType::Extension(
+                Timestamp::new_with_tz(TimeUnit::Nanoseconds, Some("UTC".into()), nullability)
+                    .erased(),
+            ),
             DUCKDB_TYPE::DUCKDB_TYPE_ARRAY => {
                 let child_type = logical_type.array_child_type();
                 DType::FixedSizeList(
@@ -239,8 +243,11 @@ impl FromLogicalType for DType {
                     .erased(),
                 )
             }
-            // Upstream: VARIANT maps to the native Vortex Variant dtype.
-            DUCKDB_TYPE::DUCKDB_TYPE_VARIANT => DType::Variant(nullability),
+            // DuckLake parity: DuckDB VARIANT is written as its shredded storage
+            // struct under the vortex.duckdb.variant extension dtype.
+            DUCKDB_TYPE::DUCKDB_TYPE_VARIANT => {
+                crate::convert::ext_types::variant_dtype(logical_type, nullability)?
+            }
             // DuckLake parity: interval/enum/bit/bignum/timetz extension types.
             DUCKDB_TYPE::DUCKDB_TYPE_INTERVAL => {
                 crate::convert::ext_types::interval_dtype(nullability)?
@@ -380,17 +387,12 @@ fn temporal_to_duckdb(temporal: TemporalMetadata) -> VortexResult<LogicalType> {
             TimeUnit::Seconds => DUCKDB_TYPE::DUCKDB_TYPE_TIMESTAMP_S,
             _ => vortex_bail!("Invalid TimeUnit {} for timestamp", unit),
         },
-        // TIMESTAMP_TZ's timezone is a display unit, time is stored in UTC
-        // microseconds
-        TemporalMetadata::Timestamp(unit, Some(_)) => {
-            if unit != &TimeUnit::Microseconds {
-                vortex_bail!(
-                    "Invalid TimeUnit {} for timestamp_tz, must be Microseconds",
-                    unit
-                );
-            }
-            DUCKDB_TYPE::DUCKDB_TYPE_TIMESTAMP_TZ
-        }
+        // TIMESTAMP_TZ's timezone is a display unit, time is stored in UTC.
+        TemporalMetadata::Timestamp(unit, Some(_)) => match unit {
+            TimeUnit::Microseconds => DUCKDB_TYPE::DUCKDB_TYPE_TIMESTAMP_TZ,
+            TimeUnit::Nanoseconds => DUCKDB_TYPE::DUCKDB_TYPE_TIMESTAMP_TZ_NS,
+            _ => vortex_bail!("Invalid TimeUnit {} for timestamp_tz", unit),
+        },
         TemporalMetadata::Date(unit) => match unit {
             TimeUnit::Days => DUCKDB_TYPE::DUCKDB_TYPE_DATE,
             _ => vortex_bail!("Invalid TimeUnit {} for date", unit),

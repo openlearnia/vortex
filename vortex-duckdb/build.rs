@@ -30,14 +30,12 @@ const BUILD_MARKER: &str = ".vx-build-complete";
 const DUCKDB_CACHE_DIR: &str = "vortex-duckdb-cache";
 const EXTRACT_MARKER: &str = ".vx-extract-complete";
 
-const SOURCE_FILES: [&str; 14] = [
+const SOURCE_FILES: [&str; 12] = [
     "cpp/vortex_duckdb.cpp",
     "cpp/copy_function.cpp",
     "cpp/expr.cpp",
-    "cpp/optimizer.cpp",
     "cpp/scalar_fn_pushdown.cpp",
     "cpp/spatial_overrides.cpp",
-    "cpp/cast_pushdown.cpp",
     "cpp/aggregate_fn_pushdown.cpp",
     "cpp/table_filter.cpp",
     "cpp/multi_file_reader.cpp",
@@ -373,8 +371,10 @@ fn git_apply(repo_dir: &Path, patch: &Path, args: &[&str]) -> bool {
 }
 
 fn apply_source_patches(crate_dir: &Path, repo_dir: &Path) {
-    let mut patches: Vec<PathBuf> = fs::read_dir(crate_dir.join("patches"))
-        .unwrap()
+    let Ok(entries) = fs::read_dir(crate_dir.join("patches")) else {
+        return;
+    };
+    let mut patches: Vec<PathBuf> = entries
         .map(|entry| entry.unwrap().path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "diff"))
         .collect();
@@ -593,6 +593,14 @@ fn compile_cpp(duckdb_include_dir: &Path) {
         // We don't want compiler warnings inside duckdb headers, pass as flags
         .flag("-isystem")
         .flag(duckdb_include_dir)
+        // DuckDB 2.x public headers pull in bundled third-party headers (fmt et al.)
+        .flag("-isystem")
+        .flag(
+            duckdb_include_dir
+                .join("../../third_party/fmt/include")
+                .canonicalize()
+                .unwrap_or_else(|_| duckdb_include_dir.join("../../third_party/fmt/include")),
+        )
         .include("include")
         .include("cpp/include")
         .files(SOURCE_FILES)

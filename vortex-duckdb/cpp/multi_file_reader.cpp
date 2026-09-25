@@ -99,11 +99,12 @@ VortexMultiFileReader::InitializeReader(MultiFileReaderData &reader_data,
 
 void VortexReaderInterface::BindReader(ClientContext &context,
                                        vector<LogicalType> &types,
-                                       vector<string> &names,
+                                       vector<Identifier> &names,
                                        MultiFileBindData &bind_data) {
     BaseFileReaderOptions options;
 
-    VortexBindResult result = {types, names};
+    vector<string> names_str;
+    VortexBindResult result = {types, names_str};
 
     VortexBindData &bind = bind_data.bind_data->Cast<VortexBindData>();
     const OpenFileInfo first_file = bind_data.file_list->GetFirstFile();
@@ -121,6 +122,9 @@ void VortexReaderInterface::BindReader(ClientContext &context,
 
     bind.ffi_bind_data = unique_ptr<CData>(reinterpret_cast<CData *>(ffi_bind_data));
     initial_reader.ffi_bind = bind.ffi_bind_data->DataPtr();
+    for (auto &name : names_str) {
+        names.emplace_back(Identifier(std::move(name)));
+    }
 
     // Fills bind_data.file_options which are used for hive partitioning and
     // "filename" column.
@@ -188,7 +192,7 @@ VortexReaderInterface::InitializeGlobalState(ClientContext &context,
 }
 
 unique_ptr<LocalTableFunctionState>
-VortexReaderInterface::InitializeLocalState(ExecutionContext &, GlobalTableFunctionState &global_state) {
+VortexReaderInterface::InitializeLocalState(ClientContext &, GlobalTableFunctionState &global_state) {
     auto &global = global_state.Cast<VortexGlobalState>();
     const void *const ffi_global = global.ffi_global_state->DataPtr();
     duckdb_vx_data ffi_local_state = duckdb_table_function_init_local(global.ffi_bind_data, ffi_global);
@@ -251,7 +255,7 @@ bool VortexBaseReader::TryInitializeScan(ClientContext &,
 
     void *const ffi_local = local.ffi_local_state->DataPtr();
     void *const ffi_file_ptr = ffi_file->DataPtr();
-    return duckdb_reader_try_initialize_scan(ffi_local, ffi_file_ptr);
+    return duckdb_reader_try_initialize_scan(ffi_local, ffi_file_ptr, nullptr);
 }
 
 AsyncResult VortexBaseReader::Scan(ClientContext &,
@@ -329,11 +333,15 @@ static unique_ptr<BaseStatistics> numeric_stats(duckdb_column_statistics &stats,
 static unique_ptr<BaseStatistics> string_stats(duckdb_column_statistics &stats, LogicalType type) {
     BaseStatistics out = StringStats::CreateUnknown(type);
     if (stats.min) {
-        StringStats::SetMin(out, StringValue::Get(UnwrapValue(stats.min)));
+        StringStats::SetMin(out,
+                            string_t(StringValue::Get(UnwrapValue(stats.min))),
+                            StringStatsType::TRUNCATED_STATS);
         duckdb_destroy_value(&stats.min);
     }
     if (stats.max) {
-        StringStats::SetMax(out, StringValue::Get(UnwrapValue(stats.max)));
+        StringStats::SetMax(out,
+                            string_t(StringValue::Get(UnwrapValue(stats.max))),
+                            StringStatsType::TRUNCATED_STATS);
         duckdb_destroy_value(&stats.max);
     }
     if (stats.max_string_length >> 63) {
@@ -409,13 +417,13 @@ unique_ptr<BaseStatistics> to_duckdb_statistics(duckdb_column_statistics &statis
     }
 }
 
-unique_ptr<BaseStatistics> VortexBaseReader::GetStatistics(ClientContext &, const string &name) {
+unique_ptr<BaseStatistics> VortexBaseReader::GetStatistics(ClientContext &, const Identifier &name) {
     D_ASSERT(ffi_bind);
     duckdb_column_statistics statistics = {};
     if (!duckdb_reader_get_statistics(ffi_file->DataPtr(),
                                       ffi_bind,
-                                      name.c_str(),
-                                      name.size(),
+                                      name.GetIdentifierName().c_str(),
+                                      name.GetIdentifierName().size(),
                                       &statistics)) {
         return {};
     }

@@ -50,7 +50,7 @@ impl DataChunkRef {
 
     /// Set the length of the data chunk.
     pub fn set_len(&mut self, len: usize) {
-        unsafe { cpp::duckdb_data_chunk_set_size(self.as_ptr(), len as _) }
+        unsafe { cpp::duckdb_vx_data_chunk_set_size(self.as_ptr(), len as _) }
     }
 
     /// Returns the vector at the specified column index.

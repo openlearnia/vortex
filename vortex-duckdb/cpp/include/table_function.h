@@ -4,6 +4,7 @@
 #pragma once
 #include "duckdb.h"
 #include "table_filter.h"
+#include "vortex_duckdb.h"
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -79,6 +80,8 @@ typedef struct {
     uint64_t file_size_bytes;
     uint64_t footer_size_bytes;
     uint64_t num_columns;
+    // Number of layout row zones (the Vortex analog of parquet row groups).
+    uint64_t row_group_count;
 } duckdb_vx_written_file_statistics;
 
 // Per-column statistics of a written Vortex file.
@@ -94,7 +97,18 @@ typedef struct {
     // Whether a NaN-count statistic was available (float columns), and whether it saw any NaN.
     bool has_nan_stat;
     bool contains_nan;
+    // Whether the min/max bounds are exact (untruncated). Inexact bounds may only be used
+    // for pruning, not for aggregate folding.
+    bool min_is_exact;
+    bool max_is_exact;
 } duckdb_vx_written_column_statistics;
+
+// Statistics for one nested leaf path (e.g. `"l"."element"`) of a written file.
+typedef struct {
+    // Owned heap string holding the quoted leaf path; release with duckdb_vx_error_free.
+    duckdb_vx_error path;
+    duckdb_vx_written_column_statistics stats;
+} duckdb_vx_written_leaf_statistics;
 
 duckdb_state duckdb_vx_register_table_functions(duckdb_database ffi_db);
 duckdb_state duckdb_vx_register_version_function(duckdb_database ffi_db, const char *version);

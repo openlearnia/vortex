@@ -119,10 +119,11 @@ impl<A: 'static + Send> RepeatedScan<A> {
         }
     }
 
+    /// Returns one task per split, paired with the file row range it covers.
     pub fn execute(
         &self,
         row_range: Option<Range<u64>>,
-    ) -> VortexResult<Vec<BoxFuture<'static, VortexResult<Option<A>>>>> {
+    ) -> VortexResult<Vec<(Range<u64>, BoxFuture<'static, VortexResult<Option<A>>>)>> {
         let selection_range: Option<Range<u64>> = match &self.selection {
             Selection::IncludeByIndex(buf) if !buf.is_empty() => {
                 Some(buf[0]..buf[buf.len() - 1] + 1)
@@ -186,7 +187,8 @@ impl<A: 'static + Send> RepeatedScan<A> {
                 continue;
             }
 
-            tasks.push(split_exec(Arc::clone(&ctx), row_mask, limit.as_mut())?);
+            let task = split_exec(Arc::clone(&ctx), row_mask, limit.as_mut())?;
+            tasks.push((range, task));
             if limit.is_some_and(|l| l == 0) {
                 break;
             }
@@ -205,7 +207,7 @@ impl<A: 'static + Send> RepeatedScan<A> {
         let handle = self.session.handle();
 
         let stream =
-            futures::stream::iter(self.execute(row_range)?).map(move |task| handle.spawn(task));
+            futures::stream::iter(self.execute(row_range)?).map(move |(_, task)| handle.spawn(task));
 
         let stream = if self.ordered {
             stream.buffered(concurrency).boxed()

@@ -4,9 +4,6 @@
 
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
-#include "optimizer.hpp"
-
-#include <optional>
 
 /**
  * Our optimizer runs after all duckdb optimizers. Functions that can be pushed
@@ -33,8 +30,9 @@ void ScalarFnCollect::VisitOperator(LogicalOperator &op) {
     LogicalOperatorVisitor::VisitOperator(op);
 }
 
-ExpressionPtr ScalarFnCollect::VisitReplace(BoundColumnRefExpression &expr, ExpressionPtr *ptr) {
-    if (const auto binding = Resolve(expr.binding, analyses, projections)) {
+unique_ptr<Expression> ScalarFnCollect::VisitReplace(BoundColumnRefExpression &expr,
+                                                   unique_ptr<Expression> *ptr) {
+    if (const auto binding = Resolve(expr.Binding(), analyses, projections)) {
         // Column is used without function applied to it, register a conflict.
         // Not emplace() as we need to update the value if it was present
         binding->analysis.col_to_expr[binding->column_index] = nullptr;
@@ -42,15 +40,16 @@ ExpressionPtr ScalarFnCollect::VisitReplace(BoundColumnRefExpression &expr, Expr
     return std::move(*ptr);
 }
 
-ExpressionPtr ScalarFnCollect::VisitReplace(BoundFunctionExpression &expr, ExpressionPtr *ptr) {
-    if (expr.children.size() != 1 ||
-        expr.children[0]->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+unique_ptr<Expression> ScalarFnCollect::VisitReplace(BoundFunctionExpression &expr,
+                                                   unique_ptr<Expression> *ptr) {
+    if (expr.GetChildren().size() != 1 ||
+        expr.GetChildren()[0]->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
         // Descend into children so e.g. fn(col, other) still sees "col" and
         // registers a conflict
         return nullptr;
     }
-    const auto &bound_col = expr.children[0]->Cast<BoundColumnRefExpression>();
-    const auto binding = Resolve(bound_col.binding, analyses, projections);
+    const auto &bound_col = expr.GetChildren()[0]->Cast<BoundColumnRefExpression>();
+    const auto binding = Resolve(bound_col.Binding(), analyses, projections);
     if (!binding) {
         return nullptr;
     }
@@ -68,47 +67,47 @@ ExpressionPtr ScalarFnCollect::VisitReplace(BoundFunctionExpression &expr, Expre
     return std::move(*ptr);
 }
 
-ExpressionPtr ScalarFnReplace::VisitReplace(BoundColumnRefExpression &expr, ExpressionPtr *ptr) {
-    const auto binding = Resolve(expr.binding, analyses, projections);
+unique_ptr<Expression> ScalarFnReplace::VisitReplace(BoundColumnRefExpression &expr,
+                                                   unique_ptr<Expression> *ptr) {
+    const auto binding = Resolve(expr.Binding(), analyses, projections);
     if (!binding) {
         return std::move(*ptr);
     }
 
-    const auto &[analysis, column_index, projection] = *binding;
+    const auto &[analysis, column_index, projection, projection_column_index] = *binding;
     if (CanPushdownColumn(analysis, column_index)) {
-        const idx_t storage_index = analysis.get.GetColumnIds()[column_index].GetPrimaryIndex();
-        const LogicalType return_type = analysis.get.returned_types[storage_index];
-        expr.return_type = return_type;
+        const LogicalType return_type = analysis.get.returned_types[analysis.StorageIndex(column_index)];
+        expr.SetReturnType(return_type);
         if (projection != nullptr && !projection->types.empty()) {
-            projection->types[column_index] = expr.return_type;
+            projection->types[projection_column_index] = return_type;
         }
     }
 
     return std::move(*ptr);
 }
 
-ExpressionPtr ScalarFnReplace::VisitReplace(BoundFunctionExpression &expr, ExpressionPtr *ptr) {
-    if (expr.children.size() != 1 ||
-        expr.children[0]->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+unique_ptr<Expression> ScalarFnReplace::VisitReplace(BoundFunctionExpression &expr,
+                                                   unique_ptr<Expression> *ptr) {
+    if (expr.GetChildren().size() != 1 ||
+        expr.GetChildren()[0]->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
         return nullptr; // Same as in ScalarFnCollect::VisitReplace
     }
-    ExpressionPtr &bound_col_base = expr.children[0];
+    auto &bound_col_base = expr.GetChildrenMutable()[0];
     const auto &bound_col = bound_col_base->Cast<BoundColumnRefExpression>();
-    const auto binding = Resolve(bound_col.binding, analyses, projections);
+    const auto binding = Resolve(bound_col.Binding(), analyses, projections);
     if (!binding) {
         return nullptr;
     }
 
-    const auto &[analysis, column_index, projection] = *binding;
+    const auto &[analysis, column_index, projection, projection_column_index] = *binding;
     if (!CanPushdownColumn(analysis, column_index)) {
         return std::move(*ptr);
     }
 
-    const idx_t storage_index = analysis.get.GetColumnIds()[column_index].GetPrimaryIndex();
-    const LogicalType return_type = analysis.get.returned_types[storage_index];
-    bound_col_base->return_type = return_type;
+    const LogicalType return_type = analysis.get.returned_types[analysis.StorageIndex(column_index)];
+    bound_col_base->SetReturnType(return_type);
     if (projection != nullptr && !projection->types.empty()) {
-        projection->types[column_index] = return_type;
+        projection->types[projection_column_index] = return_type;
     }
     return std::move(bound_col_base);
 }

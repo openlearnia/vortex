@@ -47,6 +47,7 @@ vortex = { workspace = true, features = [
 ] }
 vortex-spatial = { workspace = true }
 vortex-utils = { workspace = true, features = ["dashmap"] }
+vortex-btrblocks = { workspace = true }
 
 [features]
 opendal = ["vortex/opendal"]

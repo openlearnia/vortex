@@ -6,7 +6,6 @@
 #include "error.hpp"
 #include "scalar_fn_pushdown.hpp"
 #include "spatial_overrides.hpp"
-#include "cast_pushdown.hpp"
 #include "vortex_duckdb.h"
 
 #include "duckdb/catalog/catalog.hpp"
@@ -20,7 +19,9 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/optimizer/type_pushdown.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
@@ -173,12 +174,12 @@ static unique_ptr<TableRef> VortexScanReplacement(ClientContext &context,
     auto table_function = make_uniq<TableFunctionRef>();
 
     vector<unique_ptr<ParsedExpression>> children(1);
-    children[0] = make_uniq<ConstantExpression>(Value(table_name));
-    table_function->function = make_uniq<FunctionExpression>("read_vortex", std::move(children));
+    children[0] = ConstantExpression::FromValue(Value(table_name));
+    table_function->function = make_uniq<FunctionExpression>(Identifier("read_vortex"), std::move(children));
 
     if (!FileSystem::HasGlob(table_name)) {
         auto &fs = FileSystem::GetFileSystem(context);
-        table_function->alias = fs.ExtractBaseName(table_name);
+        table_function->alias = Identifier(fs.ExtractBaseName(table_name));
     }
 
     return table_function;
@@ -202,7 +203,7 @@ extern "C" duckdb_state duckdb_vx_register_scan_replacement(duckdb_database duck
 
 // buffer_ptr is shared_ptr, two pointers long, but duckdb_vx_reusable_dict is
 // one pointer long, so we need a wrapper.
-using Buffer = buffer_ptr<VectorChildBuffer>;
+using Buffer = buffer_ptr<DictionaryEntry>;
 struct ReusableDict {
     Buffer buffer;
     ReusableDict(Buffer buffer) : buffer(std::move(buffer)) {
@@ -236,11 +237,12 @@ extern "C" void duckdb_vx_reusable_dict_set_vector(duckdb_vx_reusable_dict reusa
 
 extern "C" void duckdb_vx_vector_dictionary_reusable(duckdb_vector ffi_vector,
                                                      duckdb_vx_reusable_dict reusable,
-                                                     duckdb_selection_vector ffi_sel_vec) {
+                                                     duckdb_selection_vector ffi_sel_vec,
+                                                     idx_t sel_count) {
     auto vector = reinterpret_cast<Vector *>(ffi_vector);
     auto *wrapper = reinterpret_cast<ReusableDict *>(reusable);
     auto sel_vec = reinterpret_cast<SelectionVector *>(ffi_sel_vec);
-    vector->Dictionary(wrapper->buffer, *sel_vec);
+    vector->Dictionary(wrapper->buffer, *sel_vec, sel_count);
 }
 
 extern "C" duckdb_value duckdb_vx_value_create_null(duckdb_logical_type ty) {
@@ -276,8 +278,9 @@ extern "C" duckdb_blob duckdb_vx_value_get_geometry(duckdb_value value) {
 }
 
 static void VortexOptimizeFunction(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
-    plan = TryPushdown<CastCollect, CastReplace>(input.context, std::move(plan));
-    plan = TryPushdown<ScalarFnCollect, ScalarFnReplace>(input.context, std::move(plan));
+    // Cast pushdown is handled by DuckDB's built-in TypePushdown optimizer pass
+    // using the function's projection_expression_pushdown callback.
+    plan = PushdownOptimize<ScalarFnCollect, ScalarFnReplace>(input.context, std::move(plan));
     plan = TryPushdownAggregateFunctions(input.context, std::move(plan));
 }
 
@@ -285,18 +288,15 @@ static void VortexPreOptimizeFunction(OptimizerExtensionInput &input, unique_ptr
     RestoreSpatialOverrides(input.context, *plan);
 }
 
-struct VortexOptimizerExtension final : OptimizerExtension {
-    inline VortexOptimizerExtension()
-        : OptimizerExtension(VortexOptimizeFunction, VortexPreOptimizeFunction, {}) {
-    }
-};
-
 extern "C" duckdb_state duckdb_vx_optimizer_extension_register(duckdb_database ffi_db) {
     D_ASSERT(ffi_db);
     const DatabaseWrapper &wrapper = *reinterpret_cast<DatabaseWrapper *>(ffi_db);
     DatabaseInstance &db = *wrapper.database->instance;
     try {
-        DBConfig::GetConfig(db).GetCallbackManager().Register(VortexOptimizerExtension());
+        OptimizerExtension extension;
+        extension.optimize_function = VortexOptimizeFunction;
+        extension.pre_optimize_function = VortexPreOptimizeFunction;
+        OptimizerExtension::Register(DBConfig::GetConfig(db), std::move(extension));
     } catch (const std::exception &e) {
         ErrorData data(e);
         DUCKDB_LOG_ERROR(db, "Failed to create Vortex optimizer extension:\t" + data.Message());

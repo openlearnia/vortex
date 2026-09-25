@@ -1,31 +1,57 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use async_fs::OpenOptions;
 use futures::SinkExt;
 use futures::TryStreamExt;
 use futures::channel::mpsc;
 use futures::channel::mpsc::Sender;
+use num_traits::Zero;
 use object_store::ObjectStore;
 use object_store::registry::ObjectStoreRegistry;
 use parking_lot::Mutex;
 use static_assertions::assert_impl_all;
 use vortex::array::ArrayRef;
+use vortex::array::Canonical;
+use vortex::array::ExecutionCtx;
+use vortex::array::VortexSessionExecute;
+use vortex::array::arrays::ListView;
+use vortex::array::arrays::PrimitiveArray;
+use vortex::array::arrays::extension::ExtensionArrayExt;
+use vortex::array::arrays::fixed_size_list::FixedSizeListArrayExt;
+use vortex::array::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
+use vortex::array::arrays::listview::ListViewArraySlotsExt;
+use vortex::array::arrays::map::MapArraySlotsExt;
+use vortex::array::arrays::primitive::PrimitiveArrayExt;
+use vortex::array::arrays::struct_::StructArrayExt;
+use vortex::array::match_each_unsigned_integer_ptype;
+use vortex::array::stats::StatsSet;
 use vortex::array::stream::ArrayStreamAdapter;
+use vortex::buffer::BufferString;
 use vortex::buffer::ByteBuffer;
+use vortex::compressor::BtrBlocksCompressorBuilder;
 use vortex::dtype::DType;
+use vortex::dtype::Field;
 use vortex::dtype::FieldName;
+use vortex::dtype::FieldNames;
+use vortex::dtype::FieldPath;
 use vortex::dtype::Nullability::NonNullable;
 use vortex::dtype::Nullability::Nullable;
 use vortex::dtype::StructFields;
-use vortex::editions::ComponentKind;
-use vortex::editions::EditionSessionExt;
+
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
+use vortex::error::vortex_ensure;
 use vortex::error::vortex_err;
+use vortex::extension::uuid::Uuid;
+use vortex::file::CompressedFieldSizes;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::expr::stats::Precision;
 use vortex::expr::stats::Stat;
@@ -39,8 +65,13 @@ use vortex::io::object_store::ObjectStoreWrite;
 use vortex::io::runtime::BlockingRuntime;
 use vortex::io::runtime::Task;
 use vortex::io::session::RuntimeSessionExt;
+use vortex::mask::Mask;
 use vortex::scalar::Scalar;
+use vortex::scalar::ScalarTruncation;
 use vortex::scalar::ScalarValue;
+use vortex::scalar::lower_bound;
+use vortex::scalar::upper_bound;
+use vortex_btrblocks::SchemeExt;
 
 /// DuckLake schema-identity metadata key written into Vortex user metadata segments.
 pub const DUCKLAKE_FIELD_IDS_METADATA_KEY: &str = "ducklake.field_ids";
@@ -51,40 +82,32 @@ use crate::SESSION;
 use crate::convert::FromLogicalType;
 use crate::convert::ToDuckDBScalar;
 use crate::convert::data_chunk_to_vortex;
+use crate::convert::ext_types::DuckVariant;
 use crate::duckdb::DataChunkRef;
 use crate::duckdb::LogicalTypeRef;
 use crate::duckdb::Value;
 
 fn copy_write_options() -> vortex::file::VortexWriteOptions {
+    // for_ingest plus DeltaScheme: fastlanes.delta is not part of any declared edition, so the
+    // writer's serialization context would reject files that contain it.
     let strategy = WriteStrategyBuilder::default()
-        .with_allow_encodings(
-            SESSION
-                .enabled_component_ids(ComponentKind::Array)
-                .into_iter()
-                .collect(),
-        )
         .for_ingest()
+        .with_btrblocks_builder(
+            BtrBlocksCompressorBuilder::default().exclude_schemes([
+                vortex_btrblocks::schemes::integer::RunEndScheme.id(),
+                vortex_btrblocks::schemes::integer::IntRLEScheme.id(),
+                vortex_btrblocks::schemes::float::ALPRDScheme.id(),
+                vortex_btrblocks::schemes::float::FloatRLEScheme.id(),
+                vortex_btrblocks::schemes::integer::DeltaScheme::default().id(),
+            ]),
+        )
         .build();
     SESSION.write_options().with_strategy(strategy)
 }
 
-fn uuid_stats_string(value: &ScalarValue) -> Option<String> {
-    let elements = value.as_list();
-    if elements.len() != 16 {
-        return None;
-    }
-    let mut bytes = [0u8; 16];
-    for (i, elem) in elements.iter().enumerate() {
-        let Some(scalar_value) = elem else {
-            return None;
-        };
-        let vortex::scalar::PValue::U8(b) = *scalar_value.as_primitive() else {
-            return None;
-        };
-        bytes[i] = b;
-    }
-    // RFC-4122 hyphenated form expected by DuckLake stats assertions.
-    Some(format!(
+/// RFC-4122 hyphenated form expected by DuckLake stats assertions.
+fn uuid_bytes_string(bytes: &[u8; 16]) -> String {
+    format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
         bytes[0],
         bytes[1],
@@ -102,7 +125,25 @@ fn uuid_stats_string(value: &ScalarValue) -> Option<String> {
         bytes[13],
         bytes[14],
         bytes[15]
-    ))
+    )
+}
+
+fn uuid_stats_string(value: &ScalarValue) -> Option<String> {
+    let elements = value.as_list();
+    if elements.len() != 16 {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for (i, elem) in elements.iter().enumerate() {
+        let Some(scalar_value) = elem else {
+            return None;
+        };
+        let vortex::scalar::PValue::U8(b) = *scalar_value.as_primitive() else {
+            return None;
+        };
+        bytes[i] = b;
+    }
+    Some(uuid_bytes_string(&bytes))
 }
 
 pub(crate) fn scalar_value_to_stats_string(dtype: &DType, value: ScalarValue) -> Option<String> {
@@ -134,6 +175,49 @@ assert_impl_all!(CopyFunctionBind: Send, Clone);
 struct FinishedWrite {
     summary: WriteSummary,
     column_sizes: Vec<u64>,
+    field_sizes: CompressedFieldSizes,
+}
+
+/// Statistics accumulated for a leaf path nested below a top-level column
+/// (e.g. `["s", "a"]` or `["l", "element"]`), merged across pushed chunks.
+struct LeafStatsAccum {
+    path: Vec<Field>,
+    dtype: DType,
+    stats: StatsSet,
+    num_values: u64,
+    /// Null count of enclosing list/array/map nodes, added to the leaf's
+    /// `null_count` to match parquet definition-level semantics (a NULL list
+    /// contributes one null leaf value).
+    extra_nulls: u64,
+}
+
+/// Untruncated min/max bounds for a top-level Utf8/Binary column, merged across
+/// pushed chunks. The footer truncates varlen bounds at 64 bytes, while
+/// DuckLake stores the parquet writer's 256-byte bounds.
+struct VarlenBounds {
+    dtype: DType,
+    stats: StatsSet,
+}
+
+/// Min/max accumulated for `vortex.uuid` leaf paths. UUID's
+/// `FixedSizeList<Primitive<U8>, 16>` storage has no statistics kernels, and its
+/// big-endian byte layout compares in the same order as the UUID values.
+#[derive(Default)]
+struct UuidStats {
+    min: Option<[u8; 16]>,
+    max: Option<[u8; 16]>,
+}
+
+/// Statistics accumulated on the converted chunk arrays, keyed by quoted dot
+/// path. The Vortex footer only stores per-top-level-field stats.
+#[derive(Default)]
+struct StatsAccumulators {
+    /// Leaf-level stats nested below a top-level column (e.g. `"l"."element"`).
+    leaf: BTreeMap<String, LeafStatsAccum>,
+    /// Per-path extrema for `vortex.uuid` columns at any depth.
+    uuid: BTreeMap<String, UuidStats>,
+    /// Untruncated bounds for top-level Utf8/Binary columns (e.g. `"s"`).
+    varlen_bounds: BTreeMap<String, VarlenBounds>,
 }
 
 /// Write to a file has two phases, writing data chunks and then closing the file.
@@ -145,6 +229,8 @@ pub struct CopyFunctionGlobal {
     write_task: Mutex<Option<Task<VortexResult<WriteSummary>>>>,
     finished: Mutex<Option<FinishedWrite>>,
     sink: Option<Sender<VortexResult<ArrayRef>>>,
+    pushed_bytes: AtomicU64,
+    stats: Mutex<StatsAccumulators>,
 }
 assert_impl_all!(CopyFunctionGlobal: Send, Sync);
 
@@ -170,6 +256,9 @@ pub fn copy_to_bind(
 }
 
 fn push_to_writer(global: &CopyFunctionGlobal, array: ArrayRef) -> VortexResult<()> {
+    global
+        .pushed_bytes
+        .fetch_add(array.nbytes(), Ordering::Relaxed);
     let mut sink = global
         .sink
         .as_ref()
@@ -194,10 +283,290 @@ pub fn copy_to_sink(
     init_global: &CopyFunctionGlobal,
     chunk: &mut DataChunkRef,
 ) -> VortexResult<()> {
-    push_to_writer(
-        init_global,
-        data_chunk_to_vortex(bind_data.fields.names(), chunk)?,
-    )
+    let array = data_chunk_to_vortex(bind_data.fields.names(), chunk)?;
+    accumulate_chunk_leaf_stats(init_global, &array)?;
+    push_to_writer(init_global, array)
+}
+
+/// Accumulate leaf stats for a synthetic single-column chunk: the C++ side
+/// evaluates the `variant_to_parquet_variant` transform for a VARIANT column
+/// and pushes the resulting parquet-shaped struct here, producing the
+/// `"col"."metadata"`/`"col"."value"`/`"col"."typed_value"...` leaf paths
+/// DuckLake expects. Physical VARIANT arrays never contribute leaf stats.
+pub fn accumulate_stats_chunk(
+    global: &CopyFunctionGlobal,
+    name: &str,
+    chunk: &DataChunkRef,
+) -> VortexResult<()> {
+    let fields = FieldNames::from([FieldName::from(name)]);
+    let array = data_chunk_to_vortex(&fields, chunk)?;
+    accumulate_chunk_leaf_stats(global, &array)
+}
+
+/// Statistics tracked per leaf path; `column_size_bytes` is attached at
+/// finalize from the footer's per-field compressed sizes.
+const LEAF_STATS: &[Stat] = &[Stat::Min, Stat::Max, Stat::NullCount, Stat::NaNCount];
+
+/// Accumulate leaf statistics for every nested field of the pushed chunk, matching
+/// the leaf paths the parquet writer emits (`"s"."child"`, `"l"."element"`).
+fn accumulate_chunk_leaf_stats(
+    global: &CopyFunctionGlobal,
+    chunk: &ArrayRef,
+) -> VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let Canonical::Struct(struct_array) = chunk.clone().execute(&mut ctx)? else {
+        vortex_bail!("COPY chunk is not a struct array, got {}", chunk.dtype());
+    };
+    let mut acc = global.stats.lock();
+    let mut path = Vec::new();
+    for (name, child) in struct_array
+        .names()
+        .iter()
+        .zip(struct_array.iter_unmasked_fields())
+    {
+        path.push(Field::Name(name.clone()));
+        accumulate_leaf_stats(&mut acc, &mut path, child, 0, &mut ctx)?;
+        path.pop();
+    }
+    Ok(())
+}
+
+/// Count the NULL leaf slots a list-like node contributes to its element
+/// children: each NULL list contributes one null leaf value and each empty
+/// (size 0) list contributes one null placeholder, matching parquet
+/// definition-level statistics where a row contributes `max(size, 1)` leaf
+/// values.
+fn list_extra_null_slots(
+    array: &ArrayRef,
+    sizes: &ArrayRef,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<u64> {
+    let extras = array.invalid_count(ctx)? as u64;
+    if extras == array.len() as u64 {
+        return Ok(extras);
+    }
+    let sizes = sizes
+        .clone()
+        .execute::<PrimitiveArray>(ctx)?
+        .reinterpret_cast(sizes.dtype().as_ptype().to_unsigned());
+    let validity = array.validity()?.execute_mask(array.len(), ctx)?;
+    let empties = match_each_unsigned_integer_ptype!(sizes.ptype(), |S| {
+        validity
+            .iter()
+            .zip(sizes.as_slice::<S>())
+            .filter(|(valid, size)| *valid && size.is_zero())
+            .count() as u64
+    });
+    Ok(extras + empties)
+}
+
+/// `extra_nulls` carries down the count of enclosing list/array/map rows that
+/// contribute a NULL leaf value rather than their elements (see
+/// [`list_extra_null_slots`]). Struct nulls need no adjustment since the leaf
+/// array retains a (null) slot per parent row.
+fn accumulate_leaf_stats(
+    acc: &mut StatsAccumulators,
+    path: &mut Vec<Field>,
+    array: &ArrayRef,
+    extra_nulls: u64,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<()> {
+    // UUID storage has no stats kernels; track extrema over its big-endian bytes,
+    // which order the same as the UUID values.
+    if let DType::Extension(ext) = array.dtype() {
+        if ext.is::<Uuid>() {
+            accumulate_uuid_stats(
+                acc.uuid.entry(quoted_leaf_key(path)).or_default(),
+                array,
+                ctx,
+            )?;
+        }
+    }
+    match array.dtype() {
+        DType::Struct(fields, _) => {
+            let Canonical::Struct(struct_array) = array.clone().execute(ctx)? else {
+                vortex_bail!("struct dtype but non-struct canonical array");
+            };
+            for (name, child) in fields
+                .names()
+                .iter()
+                .zip(struct_array.iter_unmasked_fields())
+            {
+                path.push(Field::Name(name.clone()));
+                accumulate_leaf_stats(acc, path, child, extra_nulls, ctx)?;
+                path.pop();
+            }
+        }
+        DType::List(..) => {
+            let Canonical::List(list) = array.clone().execute(ctx)? else {
+                vortex_bail!("list dtype but non-list canonical array");
+            };
+            let child_nulls = extra_nulls + list_extra_null_slots(array, list.sizes(), ctx)?;
+            path.push(Field::ElementType);
+            accumulate_leaf_stats(acc, path, list.elements(), child_nulls, ctx)?;
+            path.pop();
+        }
+        DType::FixedSizeList(..) => {
+            let Canonical::FixedSizeList(list) = array.clone().execute(ctx)? else {
+                vortex_bail!("fixed-size list dtype but non-list canonical array");
+            };
+            // A zero-width fixed-size list is empty for every row.
+            let child_nulls = extra_nulls
+                + if list.list_size() == 0 {
+                    array.len() as u64
+                } else {
+                    array.invalid_count(ctx)? as u64
+                };
+            path.push(Field::ElementType);
+            accumulate_leaf_stats(acc, path, list.elements(), child_nulls, ctx)?;
+            path.pop();
+        }
+        // Variant columns report stats through the dedicated `metadata` leaf path.
+        DType::Extension(ext) if ext.is::<DuckVariant>() => {}
+        // A map's leaf stats live on its entry struct fields: `"m"."key"` and
+        // `"m"."value"` — the parquet REPEATED `key_value` node has no stats path
+        // segment, matching DuckLake's key/value field children.
+        DType::Map(..) => {
+            let Canonical::Map(map) = array.clone().execute(ctx)? else {
+                vortex_bail!("map dtype but non-map canonical array");
+            };
+            let entries_list = map.entries().as_::<ListView>();
+            let child_nulls =
+                extra_nulls + list_extra_null_slots(array, entries_list.sizes(), ctx)?;
+            let Canonical::Struct(entries) = entries_list.elements().clone().execute(ctx)?
+            else {
+                vortex_bail!("map entries are not a struct array");
+            };
+            for (name, child) in entries
+                .names()
+                .iter()
+                .zip(entries.iter_unmasked_fields())
+            {
+                path.push(Field::Name(name.clone()));
+                accumulate_leaf_stats(acc, path, child, child_nulls, ctx)?;
+                path.pop();
+            }
+        }
+        DType::Union(..) => {}
+        _ => {
+            if path.len() < 2 {
+                // Top-level Utf8/Binary bounds are truncated in the footer at
+                // 64 bytes; accumulate them untruncated so the written stats
+                // can use the parquet-compatible 256-byte limit.
+                if path.len() == 1
+                    && matches!(array.dtype(), DType::Utf8(_) | DType::Binary(_))
+                    && let Ok(stats) = array
+                        .statistics()
+                        .compute_all(&[Stat::Min, Stat::Max], ctx)
+                {
+                    match acc.varlen_bounds.entry(quoted_leaf_key(path)) {
+                        Entry::Vacant(entry) => {
+                            entry.insert(VarlenBounds {
+                                dtype: array.dtype().clone(),
+                                stats,
+                            });
+                        }
+                        Entry::Occupied(mut entry) => {
+                            let bounds = entry.get_mut();
+                            bounds.stats = std::mem::take(&mut bounds.stats)
+                                .merge_unordered(&stats, array.dtype());
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            // Statistics are advisory: leaf types without a compute kernel simply
+            // produce no stats rather than failing the write.
+            let Ok(stats) = array.statistics().compute_all(LEAF_STATS, ctx) else {
+                return Ok(());
+            };
+            // Chunks are disjoint arrays, so bounds merge by union (min of mins);
+            // combine_sets' intersection is for stats of the same array and
+            // rejects any two chunks with different bounds.
+            match acc.leaf.entry(quoted_leaf_key(path)) {
+                Entry::Vacant(entry) => {
+                    entry.insert(LeafStatsAccum {
+                        path: path.clone(),
+                        dtype: array.dtype().clone(),
+                        stats,
+                        num_values: array.len() as u64 + extra_nulls,
+                        extra_nulls,
+                    });
+                }
+                Entry::Occupied(mut entry) => {
+                    let accum = entry.get_mut();
+                    accum.stats =
+                        std::mem::take(&mut accum.stats).merge_unordered(&stats, array.dtype());
+                    accum.num_values += array.len() as u64 + extra_nulls;
+                    accum.extra_nulls += extra_nulls;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Scan a `vortex.uuid` array's storage bytes for row-wise min/max. The 16-byte
+/// rows are big-endian with the sign bit flipped, so byte order is UUID order.
+fn accumulate_uuid_stats(
+    acc: &mut UuidStats,
+    array: &ArrayRef,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<()> {
+    let Canonical::Extension(ext_array) = array.clone().execute(ctx)? else {
+        vortex_bail!("uuid dtype but non-extension canonical array");
+    };
+    let len = ext_array.len();
+    let parts = ext_array
+        .storage_array()
+        .clone()
+        .execute::<Canonical>(ctx)?
+        .into_fixed_size_list()
+        .into_data_parts();
+    if len == 0 || parts.validity.definitely_all_null() {
+        return Ok(());
+    }
+    let mask = parts.validity.to_array(len).execute::<Mask>(ctx)?;
+    let bytes = parts
+        .elements
+        .execute::<Canonical>(ctx)?
+        .into_primitive()
+        .to_buffer::<u8>();
+    vortex_ensure!(
+        bytes.len() == len * 16,
+        "UUID storage has {} bytes, expected {}",
+        bytes.len(),
+        len * 16
+    );
+    for row in 0..len {
+        if !mask.value(row) {
+            continue;
+        }
+        let mut value = [0u8; 16];
+        value.copy_from_slice(&bytes[row * 16..(row + 1) * 16]);
+        if acc.min.is_none_or(|min| value < min) {
+            acc.min = Some(value);
+        }
+        if acc.max.is_none_or(|max| value > max) {
+            acc.max = Some(value);
+        }
+    }
+    Ok(())
+}
+
+/// Quote a leaf path the way DuckLake's `ParseQuotedList` expects: each segment
+/// wrapped in double quotes (internal quotes doubled), joined by dots.
+fn quoted_leaf_key(path: &[Field]) -> String {
+    path.iter()
+        .map(|field| {
+            let name = match field {
+                Field::Name(name) => name.as_ref(),
+                Field::ElementType => "element",
+            };
+            format!("\"{}\"", name.replace('"', "\"\""))
+        })
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 #[derive(Default)]
@@ -218,9 +587,19 @@ pub fn prepare_batch_push(
 
 pub fn flush_batch(global: &CopyFunctionGlobal, batch: &CopyPreparedBatch) -> VortexResult<()> {
     for array in &batch.arrays {
+        accumulate_chunk_leaf_stats(global, array)?;
         push_to_writer(global, array.clone())?;
     }
     Ok(())
+}
+
+/// Uncompressed bytes pushed to the writer so far. DuckLake compares this against
+/// `target_file_size` to decide file rotation; compression means it is an upper bound.
+pub fn file_size_bytes(global: &CopyFunctionGlobal) -> u64 {
+    if let Some(finished) = global.finished.lock().as_ref() {
+        return finished.summary.size();
+    }
+    global.pushed_bytes.load(Ordering::Relaxed)
 }
 
 pub fn copy_to_finalize(init_global: &mut CopyFunctionGlobal) -> VortexResult<()> {
@@ -237,9 +616,11 @@ pub fn copy_to_finalize(init_global: &mut CopyFunctionGlobal) -> VortexResult<()
         // without re-opening the file. Compute the per-column compressed sizes once, up front.
         let summary = task.await?;
         let column_sizes = summary.compressed_column_sizes().unwrap_or_default();
+        let field_sizes = summary.footer().compressed_field_sizes()?;
         *init_global.finished.lock() = Some(FinishedWrite {
             summary,
             column_sizes,
+            field_sizes,
         });
         Ok(())
     })
@@ -251,6 +632,7 @@ pub(crate) struct WrittenFileStats {
     pub file_size_bytes: u64,
     pub footer_size_bytes: u64,
     pub num_columns: usize,
+    pub row_group_count: u64,
 }
 
 /// Per-column statistics of the written Vortex file. `min`/`max` are DuckDB values converted from
@@ -258,6 +640,11 @@ pub(crate) struct WrittenFileStats {
 pub(crate) struct WrittenColumnStats {
     pub min: Option<Value>,
     pub max: Option<Value>,
+    /// Whether `min`/`max` are untruncated bounds. Truncated string bounds are
+    /// still valid bounds but must be marked inexact so DuckLake cannot fold
+    /// aggregates from them (see `StringStatsType::TRUNCATED_STATS`).
+    pub min_is_exact: bool,
+    pub max_is_exact: bool,
     pub null_count: Option<u64>,
     pub num_values: u64,
     pub column_size_bytes: Option<u64>,
@@ -280,7 +667,106 @@ pub(crate) fn written_column_stats(
     let Some(finished) = guard.as_ref() else {
         return Ok(None);
     };
-    column_stats_from_summary(&finished.summary, column_index, &finished.column_sizes).map(Some)
+    let mut stats =
+        column_stats_from_summary(&finished.summary, column_index, &finished.column_sizes)?;
+    let acc = global.stats.lock();
+    let Some(key) = top_level_stats_key(&finished.summary, column_index) else {
+        return Ok(Some(stats));
+    };
+    if let Some(uuid) = acc.uuid.get(&key) {
+        apply_uuid_stats(&mut stats, uuid);
+    }
+    if let Some(bounds) = acc.varlen_bounds.get(&key) {
+        // The footer's varlen bounds were truncated at 64 bytes; re-truncate the
+        // accumulated untruncated bounds at the DuckLake 256-byte limit.
+        let (min, min_is_exact) =
+            stats_bound_to_duckdb(bounds.stats.get(Stat::Min), Stat::Min, &bounds.dtype)?;
+        let (max, max_is_exact) =
+            stats_bound_to_duckdb(bounds.stats.get(Stat::Max), Stat::Max, &bounds.dtype)?;
+        stats.min = min;
+        stats.min_is_exact = min_is_exact;
+        stats.max = max;
+        stats.max_is_exact = max_is_exact;
+    }
+    Ok(Some(stats))
+}
+
+/// The leaf-stats key of a top-level column (`"col"`), if `column_index` names a
+/// struct field of the written file's dtype.
+fn top_level_stats_key(summary: &WriteSummary, column_index: usize) -> Option<String> {
+    let DType::Struct(fields, _) = summary.footer().dtype() else {
+        return None;
+    };
+    let name = fields.field_name(column_index)?;
+    Some(quoted_leaf_key(&[Field::Name(name.clone())]))
+}
+
+/// Fill in min/max the footer cannot compute for `vortex.uuid` columns, formatted
+/// the way the parquet writer reports UUID stats.
+fn apply_uuid_stats(stats: &mut WrittenColumnStats, uuid: &UuidStats) {
+    stats.min = uuid
+        .min
+        .map(|bytes| Value::from(uuid_bytes_string(&bytes).as_str()));
+    stats.max = uuid
+        .max
+        .map(|bytes| Value::from(uuid_bytes_string(&bytes).as_str()));
+}
+
+/// Statistics for one nested leaf path (e.g. `"l"."element"`), mirroring the leaf
+/// entries the parquet writer reports for nested columns.
+pub(crate) struct WrittenLeafStats {
+    /// Quoted dot path, e.g. `"l"."element"`.
+    pub path: String,
+    pub stats: WrittenColumnStats,
+}
+
+/// Number of leaf paths with accumulated statistics. `0` before finalize.
+pub(crate) fn written_leaf_stats_count(global: &CopyFunctionGlobal) -> u64 {
+    if global.finished.lock().is_none() {
+        return 0;
+    }
+    global.stats.lock().leaf.len() as u64
+}
+
+/// Read statistics for the leaf at `index` (BTreeMap order = sorted by quoted path).
+/// `Ok(None)` before finalize or if `index` is out of range.
+pub(crate) fn written_leaf_stats(
+    global: &CopyFunctionGlobal,
+    index: usize,
+) -> VortexResult<Option<WrittenLeafStats>> {
+    let guard = global.finished.lock();
+    let Some(finished) = guard.as_ref() else {
+        return Ok(None);
+    };
+    let acc = global.stats.lock();
+    let Some((key, leaf)) = acc.leaf.iter().nth(index) else {
+        return Ok(None);
+    };
+    let column_size_bytes = finished
+        .field_sizes
+        .get(&FieldPath::from(leaf.path.clone()));
+    let (min, min_is_exact) =
+        stats_bound_to_duckdb(leaf.stats.get(Stat::Min), Stat::Min, &leaf.dtype)?;
+    let (max, max_is_exact) =
+        stats_bound_to_duckdb(leaf.stats.get(Stat::Max), Stat::Max, &leaf.dtype)?;
+    let mut stats = WrittenColumnStats {
+        min,
+        max,
+        min_is_exact,
+        max_is_exact,
+        null_count: exact_u64(leaf.stats.get(Stat::NullCount))
+            .map(|count| count + leaf.extra_nulls),
+        has_nan: exact_u64(leaf.stats.get(Stat::NaNCount)).map(|count| count > 0),
+        num_values: leaf.num_values,
+        column_size_bytes,
+    };
+    if let Some(uuid) = acc.uuid.get(key) {
+        apply_uuid_stats(&mut stats, uuid);
+    }
+    Ok(Some(WrittenLeafStats {
+        path: key.clone(),
+        stats,
+    }))
 }
 
 fn file_stats_from_summary(summary: &WriteSummary) -> WrittenFileStats {
@@ -294,6 +780,22 @@ fn file_stats_from_summary(summary: &WriteSummary) -> WrittenFileStats {
         // Vortex has no separate footer-size hint; 0 means "read the footer normally".
         footer_size_bytes: 0,
         num_columns,
+        // Zones are the Vortex analog of parquet row groups; each column is a zoned
+        // layout whose zone-map child holds one row per zone.
+        row_group_count: file_zone_count(summary.footer().layout()),
+    }
+}
+
+fn file_zone_count(layout: &vortex::layout::LayoutRef) -> u64 {
+    // The root is a struct layout whose field slots start at 1 (slot 0 is validity).
+    let Ok(Some(field)) = layout.slot(1) else {
+        return 0;
+    };
+    if let Some(zoned) = field.as_opt::<vortex::layout::layouts::zoned::Zoned>() {
+        zoned.nzones() as u64
+    } else {
+        // Unzoned fallback: count the column's chunk children.
+        field.nchildren() as u64
     }
 }
 
@@ -322,9 +824,14 @@ fn column_stats_from_summary(
     let stats = &stats_sets[column_index];
     let dtype = &file_stats.dtypes()[column_index];
 
+    let (min, min_is_exact) = stats_bound_to_duckdb(stats.get(Stat::Min), Stat::Min, dtype)?;
+    let (max, max_is_exact) = stats_bound_to_duckdb(stats.get(Stat::Max), Stat::Max, dtype)?;
+
     Ok(WrittenColumnStats {
-        min: exact_scalar_to_duckdb(stats.get(Stat::Min), dtype)?,
-        max: exact_scalar_to_duckdb(stats.get(Stat::Max), dtype)?,
+        min,
+        max,
+        min_is_exact,
+        max_is_exact,
         null_count: exact_u64(stats.get(Stat::NullCount)),
         // NaNCount is exact only for float columns, so this is emitted just for them (as in parquet).
         has_nan: exact_u64(stats.get(Stat::NaNCount)).map(|count| count > 0),
@@ -334,18 +841,54 @@ fn column_stats_from_summary(
     })
 }
 
-/// Convert an exact scalar statistic to a DuckDB value, propagating a conversion failure rather than
-/// dropping it. `Ok(None)` when the statistic is not exactly known.
-fn exact_scalar_to_duckdb(
+/// Byte limit for Utf8/Binary min/max reported to DuckLake, matching the parquet
+/// writer's `MAX_STRING_STATISTICS_SIZE`.
+const STATS_BOUND_MAX_BYTES: usize = 256;
+
+/// Convert a Min/Max statistic to a DuckDB value plus its exactness. Bounds that
+/// are only `Precision::Inexact` are still reported (as inexact) rather than
+/// dropped, and Utf8/Binary bounds longer than `STATS_BOUND_MAX_BYTES` are
+/// truncated to a still-valid inexact bound, like the parquet writer.
+fn stats_bound_to_duckdb(
     stat: Precision<ScalarValue>,
+    stat_kind: Stat,
     dtype: &DType,
-) -> VortexResult<Option<Value>> {
-    match stat {
-        Precision::Exact(value) => Ok(Some(
-            Scalar::try_new(dtype.clone(), Some(value))?.try_to_duckdb_scalar()?,
-        )),
-        _ => Ok(None),
-    }
+) -> VortexResult<(Option<Value>, bool)> {
+    let mut is_exact = stat.is_exact();
+    let Some(value) = stat.into_inner() else {
+        return Ok((None, true));
+    };
+    let scalar = Scalar::try_new(dtype.clone(), Some(value))?;
+    let nullability = dtype.nullability();
+    let bound = match (stat_kind, dtype) {
+        (Stat::Min, DType::Utf8(_)) => lower_bound(
+            BufferString::from_scalar(scalar)?,
+            STATS_BOUND_MAX_BYTES,
+            nullability,
+        ),
+        (Stat::Min, DType::Binary(_)) => lower_bound(
+            ByteBuffer::from_scalar(scalar)?,
+            STATS_BOUND_MAX_BYTES,
+            nullability,
+        ),
+        (Stat::Max, DType::Utf8(_)) => upper_bound(
+            BufferString::from_scalar(scalar)?,
+            STATS_BOUND_MAX_BYTES,
+            nullability,
+        ),
+        (Stat::Max, DType::Binary(_)) => upper_bound(
+            ByteBuffer::from_scalar(scalar)?,
+            STATS_BOUND_MAX_BYTES,
+            nullability,
+        ),
+        _ => Some((scalar, false)),
+    };
+    // A missing bound (e.g. an upper bound that cannot be incremented) drops the stat.
+    let Some((bound, was_truncated)) = bound else {
+        return Ok((None, false));
+    };
+    is_exact &= !was_truncated;
+    Ok((Some(bound.try_to_duckdb_scalar()?), is_exact))
 }
 
 /// Extract an exact `u64` statistic (e.g. a count), or `None` if not exactly known.
@@ -415,6 +958,8 @@ pub fn copy_to_initialize_global(
         write_task: Mutex::new(Some(write_task)),
         finished: Mutex::new(None),
         sink: Some(sink),
+        pushed_bytes: AtomicU64::new(0),
+        stats: Mutex::new(StatsAccumulators::default()),
     })
 }
 

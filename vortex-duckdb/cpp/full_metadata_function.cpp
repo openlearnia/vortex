@@ -10,6 +10,7 @@
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/capi/capi_internal.hpp"
@@ -65,13 +66,13 @@ struct VortexFullMetadataGlobalState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> VortexFullMetadataBind(ClientContext &context, TableFunctionBindInput &input,
-                                                vector<LogicalType> &return_types, vector<string> &names) {
+                                                vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto multi_file_reader = MultiFileReader::CreateDefault("VortexFullMetadata");
 	auto result = make_uniq<VortexFullMetadataBindData>();
 	result->files =
 	    multi_file_reader->CreateFileList(context, input.inputs[0], FileGlobInput(FileGlobOptions::FALLBACK_GLOB, "vortex"));
 
-	names = {"vortex_file_metadata", "vortex_schema", "vortex_column_stats"};
+	names = {Identifier("vortex_file_metadata"), Identifier("vortex_schema"), Identifier("vortex_column_stats")};
 	return_types = {LogicalType::LIST(FileMetadataStructType()), LogicalType::LIST(SchemaStructType()),
 	                LogicalType::LIST(ColumnStatsStructType())};
 	return std::move(result);
@@ -175,12 +176,12 @@ void VortexFullMetadataExecute(ClientContext &, TableFunctionInput &input, DataC
 		unique_ptr<CData> metadata(reinterpret_cast<CData *>(raw));
 		void *meta = metadata->DataPtr();
 
-		output.SetValue(0, row, BuildFileMetadataValue(file.path, meta));
-		output.SetValue(1, row, BuildSchemaValue(meta));
-		output.SetValue(2, row, BuildColumnStatsValue(meta));
+		output.data[0].SetValue(row, BuildFileMetadataValue(file.path, meta));
+		output.data[1].SetValue(row, BuildSchemaValue(meta));
+		output.data[2].SetValue(row, BuildColumnStatsValue(meta));
 		row++;
 	}
-	output.SetCardinality(row);
+	output.SetCardinalityUnsafe(row);
 }
 
 } // namespace

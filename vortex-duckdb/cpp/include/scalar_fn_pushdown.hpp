@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 #pragma once
-#include "optimizer.hpp"
+#include "duckdb/optimizer/type_pushdown.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 
@@ -18,8 +18,8 @@ struct ScalarFnCollect final : LogicalOperatorVisitor {
 
     ScalarFnCollect(Analyses &analyses, const Projections &projections);
     void VisitOperator(LogicalOperator &op) override;
-    ExpressionPtr VisitReplace(BoundColumnRefExpression &expr, ExpressionPtr *ptr) override;
-    ExpressionPtr VisitReplace(BoundFunctionExpression &expr, ExpressionPtr *ptr) override;
+    unique_ptr<Expression> VisitReplace(BoundColumnRefExpression &expr, unique_ptr<Expression> *ptr) override;
+    unique_ptr<Expression> VisitReplace(BoundFunctionExpression &expr, unique_ptr<Expression> *ptr) override;
 };
 
 /*
@@ -32,6 +32,6 @@ struct ScalarFnReplace final : LogicalOperatorVisitor {
     const Projections &projections;
 
     ScalarFnReplace(Analyses &analyses, const Projections &aliases);
-    ExpressionPtr VisitReplace(BoundColumnRefExpression &expr, ExpressionPtr *ptr) override;
-    ExpressionPtr VisitReplace(BoundFunctionExpression &expr, ExpressionPtr *ptr) override;
+    unique_ptr<Expression> VisitReplace(BoundColumnRefExpression &expr, unique_ptr<Expression> *ptr) override;
+    unique_ptr<Expression> VisitReplace(BoundFunctionExpression &expr, unique_ptr<Expression> *ptr) override;
 };

@@ -15,15 +15,19 @@ use crate::convert::can_push_expression;
 use crate::copy::CopyFunctionBind;
 use crate::copy::CopyFunctionGlobal;
 use crate::copy::CopyPreparedBatch;
+use crate::copy::accumulate_stats_chunk;
 use crate::copy::copy_to_bind;
 use crate::copy::copy_to_finalize;
 use crate::copy::copy_to_initialize_global;
 use crate::copy::copy_to_sink;
+use crate::copy::file_size_bytes;
 use crate::copy::read_ducklake_field_ids_metadata;
 use crate::copy::flush_batch;
 use crate::copy::prepare_batch_push;
 use crate::copy::written_column_stats;
 use crate::copy::written_file_stats;
+use crate::copy::written_leaf_stats;
+use crate::copy::written_leaf_stats_count;
 use crate::cpp;
 use crate::duckdb::AggregatePushdownInput;
 use crate::duckdb::BindResult;
@@ -166,6 +170,12 @@ pub unsafe extern "C-unwind" fn duckdb_table_function_init_local(
     let global = unsafe { global.cast::<GlobalState>().as_ref() }.vortex_expect("null pointer");
     let local = init_local(bind, global);
     Data::from(Box::new(local)).as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_table_function_filters_dropped(global: *const c_void) -> bool {
+    let global = unsafe { global.cast::<GlobalState>().as_ref() }.vortex_expect("null pointer");
+    global.filter.dropped_any
 }
 
 #[unsafe(no_mangle)]
@@ -326,14 +336,26 @@ pub unsafe extern "C-unwind" fn duckdb_reader_is_aggregate(bind: *const c_void) 
     !bind.aggregates.is_empty()
 }
 
+/// Claims one scan split for `local`. On success writes the split's first row
+/// index within the file to `row_start_out` (may be null if unneeded) and
+/// returns true.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn duckdb_reader_try_initialize_scan(
     local: *mut c_void,
     file: *mut c_void,
+    row_start_out: *mut u64,
 ) -> bool {
     let file = unsafe { file.cast::<OpenFileReader>().as_mut() }.vortex_expect("null pointer");
     let local = unsafe { local.cast::<LocalState>().as_mut() }.vortex_expect("null pointer");
-    reader_try_initialize_scan(file, local)
+    let Some(row_start) = reader_try_initialize_scan(file, local) else {
+        return false;
+    };
+    if !row_start_out.is_null() {
+        unsafe {
+            *row_start_out = row_start;
+        }
+    }
+    true
 }
 
 #[unsafe(no_mangle)]
@@ -696,6 +718,35 @@ pub unsafe extern "C-unwind" fn duckdb_copy_function_flush_batch(
     try_or(error, || flush_batch(global, batch))
 }
 
+/// Accumulate leaf statistics for a synthetic single-column chunk produced by
+/// the C++ variant transform. The chunk's single column is named `column_name`
+/// (the original VARIANT column).
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_copy_function_accumulate_stats_chunk(
+    global: *const c_void,
+    column_name: *const c_char,
+    column_name_len: usize,
+    chunk: cpp::duckdb_data_chunk,
+    error: *mut cpp::duckdb_vx_error,
+) {
+    let global =
+        unsafe { global.cast::<CopyFunctionGlobal>().as_ref() }.vortex_expect("null pointer");
+    let name_bytes =
+        unsafe { std::slice::from_raw_parts(column_name.cast::<u8>(), column_name_len) };
+    let column_name = String::from_utf8_lossy(name_bytes);
+    let chunk = unsafe { DataChunk::borrow(chunk) };
+    try_or(error, || accumulate_stats_chunk(global, &column_name, chunk))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_copy_function_file_size_bytes(
+    global_data: *const c_void,
+) -> cpp::idx_t {
+    let global_data = unsafe { global_data.cast::<CopyFunctionGlobal>().as_ref() }
+        .vortex_expect("global_data null pointer");
+    file_size_bytes(global_data) as cpp::idx_t
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn duckdb_copy_function_get_written_file_statistics(
     global_data: *const c_void,
@@ -711,6 +762,7 @@ pub unsafe extern "C-unwind" fn duckdb_copy_function_get_written_file_statistics
     out.file_size_bytes = stats.file_size_bytes;
     out.footer_size_bytes = stats.footer_size_bytes;
     out.num_columns = stats.num_columns as u64;
+    out.row_group_count = stats.row_group_count;
     true
 }
 
@@ -737,6 +789,50 @@ pub unsafe extern "C-unwind" fn duckdb_copy_function_get_written_column_statisti
         out.column_size_bytes = stats.column_size_bytes.unwrap_or(0);
         out.has_nan_stat = stats.has_nan.is_some();
         out.contains_nan = stats.has_nan.unwrap_or(false);
+        out.min_is_exact = stats.min_is_exact;
+        out.max_is_exact = stats.max_is_exact;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_copy_function_get_written_leaf_statistics_count(
+    global_data: *const c_void,
+) -> cpp::idx_t {
+    let global_data = unsafe { global_data.cast::<CopyFunctionGlobal>().as_ref() }
+        .vortex_expect("global_data null pointer");
+    written_leaf_stats_count(global_data) as cpp::idx_t
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_copy_function_get_written_leaf_statistics(
+    global_data: *const c_void,
+    leaf_index: usize,
+    out: *mut cpp::duckdb_vx_written_leaf_statistics,
+    error_out: *mut cpp::duckdb_vx_error,
+) -> bool {
+    let global_data = unsafe { global_data.cast::<CopyFunctionGlobal>().as_ref() }
+        .vortex_expect("global_data null pointer");
+    try_or(error_out, || {
+        let Some(leaf) = written_leaf_stats(global_data, leaf_index)? else {
+            return Ok(false);
+        };
+        let out = unsafe { &mut *out };
+        out.path = unsafe {
+            cpp::duckdb_vx_error_create(leaf.path.as_ptr().cast(), leaf.path.len())
+        };
+        let stats = leaf.stats;
+        out.stats.min = stats.min.map_or(ptr::null_mut(), |v| v.into_ptr());
+        out.stats.max = stats.max.map_or(ptr::null_mut(), |v| v.into_ptr());
+        out.stats.has_null_count = stats.null_count.is_some();
+        out.stats.null_count = stats.null_count.unwrap_or(0);
+        out.stats.num_values = stats.num_values;
+        out.stats.has_column_size = stats.column_size_bytes.is_some();
+        out.stats.column_size_bytes = stats.column_size_bytes.unwrap_or(0);
+        out.stats.has_nan_stat = stats.has_nan.is_some();
+        out.stats.contains_nan = stats.has_nan.unwrap_or(false);
+        out.stats.min_is_exact = stats.min_is_exact;
+        out.stats.max_is_exact = stats.max_is_exact;
         Ok(true)
     })
 }

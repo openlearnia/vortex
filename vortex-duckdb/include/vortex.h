@@ -74,6 +74,8 @@ duckdb_vx_data duckdb_table_function_init_global(const duckdb_vx_tfunc_init_inpu
 
 extern duckdb_vx_data duckdb_table_function_init_local(const void *bind, const void *global);
 
+extern bool duckdb_table_function_filters_dropped(const void *global);
+
 extern
 duckdb_vx_data duckdb_reader_bind(const void *first_file,
                                   duckdb_bind_result result,
@@ -83,6 +85,13 @@ extern
 duckdb_vx_data duckdb_reader_open(const char *file_path,
                                   size_t file_path_len,
                                   duckdb_vx_error *error);
+
+extern
+duckdb_vx_data duckdb_reader_open_with_key(const char *file_path,
+                                           size_t file_path_len,
+                                           const uint8_t *encryption_key_bytes,
+                                           size_t encryption_key_len,
+                                           duckdb_vx_error *error);
 
 extern
 bool duckdb_reader_get_statistics(const void *file,
@@ -111,7 +120,7 @@ extern duckdb_logical_type duckdb_reader_bind_column_type(const void *bind, size
 
 extern bool duckdb_reader_is_aggregate(const void *bind);
 
-extern bool duckdb_reader_try_initialize_scan(void *local, void *file);
+extern bool duckdb_reader_try_initialize_scan(void *local, void *file, uint64_t *row_start_out);
 
 extern
 bool duckdb_reader_scan(const void *file,
@@ -153,28 +162,7 @@ void duckdb_copy_function_copy_to_sink(const void *bind_data,
                                        duckdb_data_chunk data_chunk,
                                        duckdb_vx_error *error_out);
 
-extern
-void duckdb_copy_function_copy_to_finalize(void *global_data,
-                                           uint64_t *row_count_out,
-                                           uint64_t *file_size_out,
-                                           duckdb_vx_error *error_out);
-
-extern uint64_t duckdb_copy_function_exported_stats_count(const void *global_data);
-
-extern
-bool duckdb_copy_function_exported_stat_at(const void *global_data,
-                                           uint64_t index,
-                                           char **name_out,
-                                           uint64_t *null_count_out,
-                                           bool *has_null_count_out,
-                                           uint64_t *num_values_out,
-                                           bool *has_num_values_out,
-                                           uint64_t *column_size_out,
-                                           bool *has_column_size_out,
-                                           char **min_out,
-                                           char **max_out,
-                                           bool *has_nan_out,
-                                           bool *has_has_nan_out);
+extern void duckdb_copy_function_copy_to_finalize(void *global_data, duckdb_vx_error *error_out);
 
 extern
 duckdb_vx_data duckdb_vortex_full_metadata_open(const char *file_path,
@@ -217,6 +205,15 @@ void duckdb_copy_function_flush_batch(const void *global,
                                       duckdb_vx_error *error);
 
 extern
+void duckdb_copy_function_accumulate_stats_chunk(const void *global,
+                                                 const char *column_name,
+                                                 size_t column_name_len,
+                                                 duckdb_data_chunk chunk,
+                                                 duckdb_vx_error *error);
+
+extern idx_t duckdb_copy_function_file_size_bytes(const void *global_data);
+
+extern
 bool duckdb_copy_function_get_written_file_statistics(const void *global_data,
                                                       duckdb_vx_written_file_statistics *out);
 
@@ -225,6 +222,14 @@ bool duckdb_copy_function_get_written_column_statistics(const void *global_data,
                                                         size_t column_index,
                                                         duckdb_vx_written_column_statistics *out,
                                                         duckdb_vx_error *error_out);
+
+extern idx_t duckdb_copy_function_get_written_leaf_statistics_count(const void *global_data);
+
+extern
+bool duckdb_copy_function_get_written_leaf_statistics(const void *global_data,
+                                                      size_t leaf_index,
+                                                      duckdb_vx_written_leaf_statistics *out,
+                                                      duckdb_vx_error *error_out);
 
 #ifdef __cplusplus
 }  // extern "C"

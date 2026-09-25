@@ -207,7 +207,7 @@ impl ToDuckDBScalar for ExtScalar<'_> {
                 | crate::convert::ext_types::VARIANT_EXT_ID
                 | crate::convert::ext_types::TIME_TZ_EXT_ID
         ) {
-            return Ok(Value::null(&logical_type));
+            return Ok(Value::null(&*ext_logical_type(self)?));
         }
 
         let Some(temporal) = self.ext_dtype().metadata_opt::<AnyTemporal>() else {
@@ -276,6 +276,24 @@ fn timestamp_tz_micros(unit: TimeUnit, raw: i64) -> VortexResult<i64> {
     }
 }
 
+/// Builds a `vortex.hugeint`/`vortex.uhugeint` extension scalar from the 16
+/// order-preserving storage bytes written by `hugeint_vector_to_vortex`.
+fn hugeint_ext_scalar(dtype: &DType, bytes: [u8; 16]) -> VortexResult<Scalar> {
+    let DType::Extension(ext) = dtype else {
+        vortex_bail!("hugeint value must map to an extension dtype, got {dtype}");
+    };
+    let children = bytes
+        .iter()
+        .map(|&byte| Scalar::primitive(byte, NonNullable))
+        .collect();
+    let storage = Scalar::fixed_size_list(
+        DType::Primitive(PType::U8, NonNullable),
+        children,
+        Nullable,
+    );
+    Ok(Scalar::extension_ref(ext.clone(), storage))
+}
+
 impl TryFrom<Value> for Scalar {
     type Error = VortexError;
 
@@ -305,12 +323,11 @@ impl<'a> TryFrom<&'a ValueRef> for Scalar {
             ExtractedValue::SmallInt(v) => Ok(Scalar::primitive(v, Nullable)),
             ExtractedValue::Integer(v) => Ok(Scalar::primitive(v, Nullable)),
             ExtractedValue::BigInt(v) => Ok(Scalar::primitive(v, Nullable)),
-            ExtractedValue::HugeInt(_) => {
-                vortex_bail!("DuckDB HugeInt is not yet supported in Vortex");
+            ExtractedValue::HugeInt(v) => {
+                // Sign-flipped big-endian, matching `hugeint_vector_to_vortex`.
+                hugeint_ext_scalar(&dtype, (v as u128 ^ (1u128 << 127)).to_be_bytes())
             }
-            ExtractedValue::UHugeInt(_) => {
-                vortex_bail!("DuckDB UHugeInt is not yet supported in Vortex");
-            }
+            ExtractedValue::UHugeInt(v) => hugeint_ext_scalar(&dtype, v.to_be_bytes()),
             ExtractedValue::UTinyInt(v) => Ok(Scalar::primitive(v, Nullable)),
             ExtractedValue::USmallInt(v) => Ok(Scalar::primitive(v, Nullable)),
             ExtractedValue::UInteger(v) => Ok(Scalar::primitive(v, Nullable)),
@@ -756,5 +773,38 @@ mod tests {
             DUCKDB_TYPE::DUCKDB_TYPE_TIMESTAMP
         );
         assert!(matches!(value.extract(), ExtractedValue::Null));
+    }
+
+    fn hugeint_storage_bytes(value: i128) -> [u8; 16] {
+        let scalar = Scalar::try_from(&*Value::new_hugeint(value)).unwrap();
+        let storage = scalar.as_extension().to_storage_scalar();
+        let elements = storage.value().unwrap().as_list();
+        let mut bytes = [0u8; 16];
+        for (i, elem) in elements.iter().enumerate() {
+            let vortex::scalar::PValue::U8(byte) = *elem.as_ref().unwrap().as_primitive()
+            else {
+                panic!("hugeint storage element is not u8");
+            };
+            bytes[i] = byte;
+        }
+        bytes
+    }
+
+    #[test]
+    fn try_from_hugeint_value() {
+        let scalar = Scalar::try_from(&*Value::new_hugeint(-1)).unwrap();
+        let DType::Extension(ext) = scalar.dtype() else {
+            panic!("hugeint scalar must be an extension scalar");
+        };
+        assert_eq!(
+            ext.id().as_ref(),
+            crate::convert::ext_types::HUGEINT_EXT_ID
+        );
+
+        // Sign-flipped big-endian storage orders like the i128 values.
+        assert!(hugeint_storage_bytes(i128::MIN) < hugeint_storage_bytes(-1));
+        assert!(hugeint_storage_bytes(-1) < hugeint_storage_bytes(0));
+        assert!(hugeint_storage_bytes(0) < hugeint_storage_bytes(i128::MAX));
+        assert_eq!(hugeint_storage_bytes(0)[0], 0x80);
     }
 }

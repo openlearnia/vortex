@@ -5,8 +5,11 @@
 
 #include "data.hpp"
 #include "duckdb.h"
+#include "duckdb/common/projection_index.hpp"
 #include "duckdb/function/function.hpp"
+#include "duckdb/function/partition_stats.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/storage/storage_index.hpp"
 
 using namespace duckdb;
 
@@ -16,20 +19,18 @@ bool is_vortex_scan(const TableFunction &function);
 
 duckdb_state register_vortex_full_metadata(DatabaseInstance &db);
 
-struct TableFunctionProjectionExpressionInput {
-    const LogicalGet &get;
-    const Expression &expression;
-    idx_t projection_idx;
-};
-
 // true if we can push down the expression, false otherwise
 bool projection_expression_pushdown(ClientContext &context,
                                     const TableFunctionProjectionExpressionInput &input);
 
+//! Sentinel scan index for count_star() which has no column argument.
+//! ProjectionIndex() is INVALID_INDEX, matching the FFI-side idx_t max sentinel.
+inline const ProjectionIndex COUNT_STAR_PROJ_IDX;
+
 struct TableFunctionUngroupedAggregateInput {
     const LogicalGet &get;
     // Column scan index -> aggregate expression
-    const vector<std::pair<idx_t, const Expression &>> &projections;
+    const vector<std::pair<ProjectionIndex, const Expression &>> &projections;
 };
 
 bool aggregate_pushdown(ClientContext &context, const TableFunctionUngroupedAggregateInput &input);
@@ -52,9 +53,12 @@ struct VortexRowGroup final : PartitionRowGroup {
     unique_ptr<CData> ffi_footer;
 
     unique_ptr<BaseStatistics> GetColumnStatistics(const StorageIndex &storage_index) override;
-    bool MinMaxIsExact(const BaseStatistics &, const StorageIndex &) override {
-        // TODO(myrrc): in duckdb 2.0 we should report false for strings and
+    bool MinMaxIsExact(const StorageIndex &) override {
+        // TODO(myrrc): we should report false for strings and
         // also add TRUNCATED_STATS type for them
         return true;
+    }
+    bool HasPendingWrites() override {
+        return false;
     }
 };

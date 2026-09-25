@@ -82,7 +82,7 @@ duckdb_vx_expr duckdb_vx_table_filter_get_expression(duckdb_vx_table_filter ffi_
 
 typedef struct {
     duckdb_vx_table_filter child_filter;
-    char *child_name;
+    const char *child_name;
     size_t child_name_len;
 } duckdb_vx_table_filter_struct_extract;
 

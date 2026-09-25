@@ -78,11 +78,12 @@ impl VectorRef {
                          but copy path was taken"
                     );
 
-                    let source = values.bit_buffer().inner().as_slice();
+                    let bit_buffer = values.bit_buffer();
+                    let source = bit_buffer.inner().as_slice();
                     copy_from_slice(
                         unsafe { self.ensure_validity_slice(len) },
                         source,
-                        offset,
+                        bit_buffer.offset() + offset,
                         len,
                     );
                 }

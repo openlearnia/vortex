@@ -23,6 +23,7 @@ use vortex::error::vortex_err;
 use vortex::scalar::ScalarValue;
 use vortex::session::registry::CachedId;
 
+use crate::convert::dtype::FromLogicalType;
 use crate::cpp::DUCKDB_TYPE;
 use crate::duckdb::LogicalType;
 use crate::duckdb::LogicalTypeRef;
@@ -171,6 +172,30 @@ pub fn time_tz_dtype(nullability: Nullability) -> VortexResult<DType> {
         ExtDType::<DuckTimeTz>::try_new(
             EmptyExtMetadata,
             DType::Primitive(PType::U64, nullability),
+        )?
+        .erased(),
+    ))
+}
+
+/// DuckDB VARIANT is written as its shredded storage struct wrapped in the
+/// `vortex.duckdb.variant` extension dtype (see `variant_vector_to_vortex`).
+/// The bind-time dtype must match the per-chunk storage layout exactly.
+pub fn variant_dtype(logical_type: &LogicalTypeRef, nullability: Nullability) -> VortexResult<DType> {
+    let fields: StructFields = (0..logical_type.struct_type_child_count())
+        .map(|i| {
+            Ok((
+                logical_type.struct_child_name(i),
+                DType::from_logical_type(
+                    &logical_type.struct_child_type(i),
+                    Nullability::Nullable,
+                )?,
+            ))
+        })
+        .collect::<VortexResult<_>>()?;
+    Ok(DType::Extension(
+        ExtDType::<DuckVariant>::try_new(
+            EmptyExtMetadata,
+            DType::Struct(fields, nullability),
         )?
         .erased(),
     ))

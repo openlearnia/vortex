@@ -16,6 +16,7 @@
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
@@ -31,7 +32,7 @@ struct SpatialOverride {
 
 /// Drop spatial's bind so the filter keeps the radius visible as `children[2]`.
 static void DropBind(ScalarFunction &fn) {
-    fn.bind = nullptr;
+    fn.SetBindCallback(nullptr);
 }
 
 /// Clear the error mode so the filter pushes through view projections.
@@ -46,22 +47,32 @@ static constexpr SpatialOverride SPATIAL_OVERRIDES[] = {
     {"st_within", 2, ClearErrorMode},
 };
 
+/// Look up a scalar function in the system catalog, returning null when absent.
+static optional_ptr<ScalarFunctionCatalogEntry> FindSystemScalarFunction(ClientContext &context,
+                                                                         const char *name) {
+    auto entry = Catalog::GetSystemCatalog(context).GetEntry(context,
+                                                           CatalogType::SCALAR_FUNCTION_ENTRY,
+                                                           Identifier::DefaultSchema(),
+                                                           Identifier(name),
+                                                           OnEntryNotFound::RETURN_NULL);
+    if (!entry) {
+        return nullptr;
+    }
+    return &entry->Cast<ScalarFunctionCatalogEntry>();
+}
+
 /// Apply one override, later calls to the function bind to the pushable copy instead of
 /// spatial's original.
 static void RegisterSpatialOverride(ClientContext &context, const SpatialOverride &fn_override) {
-    auto &system = Catalog::GetSystemCatalog(context);
-    auto entry = system.GetEntry<ScalarFunctionCatalogEntry>(context,
-                                                             DEFAULT_SCHEMA,
-                                                             fn_override.name,
-                                                             OnEntryNotFound::RETURN_NULL);
+    auto entry = FindSystemScalarFunction(context, fn_override.name);
     if (!entry) {
         return;
     }
-    ScalarFunctionSet set(fn_override.name);
+    ScalarFunctionSet set(Identifier(fn_override.name));
     for (const auto &overload : entry->functions.functions) {
-        ScalarFunction copy = overload;
+        ScalarFunction copy = *overload;
         fn_override.tweak(copy);
-        set.AddFunction(copy);
+        set.AddFunction(std::move(copy));
     }
     CreateScalarFunctionInfo info(std::move(set));
     info.on_conflict = OnCreateConflict::REPLACE_ON_CONFLICT;
@@ -123,24 +134,20 @@ unique_ptr<Expression> SpatialOverrideRestore::VisitReplace(BoundFunctionExpress
         std::any_of(std::begin(SPATIAL_OVERRIDES),
                     std::end(SPATIAL_OVERRIDES),
                     [&](const SpatialOverride &o) {
-                        return expr.function.name == o.name && expr.children.size() == o.arity;
+                        return expr.Function().GetName() == o.name && expr.GetChildren().size() == o.arity;
                     });
     if (!overridden) {
         return nullptr; // Not an overridden call: leave it as is.
     }
     // Spatial's original lives in the system catalog, where the override cannot shadow it.
-    auto original =
-        Catalog::GetSystemCatalog(context).GetEntry<ScalarFunctionCatalogEntry>(context,
-                                                                                DEFAULT_SCHEMA,
-                                                                                expr.function.name,
-                                                                                OnEntryNotFound::RETURN_NULL);
+    auto original = FindSystemScalarFunction(context, expr.Function().GetName().GetIdentifierName().c_str());
     if (!original) {
         return nullptr;
     }
     // Rebind a copy of the call's arguments through the original function.
     vector<unique_ptr<Expression>> children;
-    children.reserve(expr.children.size());
-    for (const auto &child : expr.children) {
+    children.reserve(expr.GetChildren().size());
+    for (const auto &child : expr.GetChildren()) {
         children.push_back(child->Copy());
     }
     ErrorData error;

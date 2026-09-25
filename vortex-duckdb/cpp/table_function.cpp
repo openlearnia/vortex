@@ -16,7 +16,8 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/default/default_functions.hpp"
 #include "duckdb/common/insertion_order_preserving_map.hpp"
-#include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/logging/logger.hpp"
+#include "duckdb/common/sql_identifier.hpp"
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/capi/capi_internal.hpp"
@@ -41,14 +42,15 @@ static void *get_ffi_bind(const FunctionData *bind_data) {
 }
 
 bool projection_expression_pushdown(ClientContext &, const TableFunctionProjectionExpressionInput &input) {
-    duckdb_vx_expr ffi_expr = get_ffi_expr(input.expression);
+    duckdb_vx_expr ffi_expr = get_ffi_expr(input.expr);
     void *const ffi_bind = get_ffi_bind(input.get.bind_data.get());
     duckdb_vx_error error_out = nullptr;
 
+    const idx_t storage_idx = input.get.GetColumnIds()[input.column_index].GetPrimaryIndex();
     const bool ret = duckdb_table_function_pushdown_projection_expression( //
         ffi_bind,
         ffi_expr,
-        input.projection_idx,
+        storage_idx,
         &error_out);
     if (error_out) {
         throw BinderException(IntoErrString(error_out));
@@ -64,8 +66,9 @@ idx_t duckdb_vx_aggregate_len(duckdb_vx_agg_input ffi_input) {
 duckdb_vx_expr duckdb_vx_aggregate_at(duckdb_vx_agg_input ffi_input, idx_t i, idx_t *proj_idx) {
     const auto &input = *reinterpret_cast<const TableFunctionUngroupedAggregateInput *>(ffi_input);
     const auto &[scan_index, expr] = input.projections[i];
-    *proj_idx = scan_index == COUNT_STAR_PROJ_IDX ? scan_index
-                                                  : input.get.GetColumnIds()[scan_index].GetPrimaryIndex();
+    *proj_idx = scan_index == COUNT_STAR_PROJ_IDX
+                    ? scan_index.GetIndexUnsafe()
+                    : input.get.GetColumnIds()[scan_index].GetPrimaryIndex();
     return get_ffi_expr(expr);
 }
 }
@@ -182,7 +185,7 @@ static vector<PartitionStatistics> get_partition_stats(ClientContext &, GetParti
 }
 
 duckdb_state register_table_function(DatabaseInstance &db, LogicalType parameter, const std::string &name) {
-    MultiFileFunction<VortexReaderInterface> fn(name);
+    MultiFileFunction<VortexReaderInterface> fn {Identifier(name)};
     fn.arguments[0] = parameter;
     fn.named_parameters = {{"filename", LogicalType::ANY},
                            {"allow_empty", LogicalType::BOOLEAN},
@@ -202,6 +205,7 @@ duckdb_state register_table_function(DatabaseInstance &db, LogicalType parameter
     fn.pushdown_complex_filter = [](auto &, auto &, FunctionData *bind_data, FilterVec &filters) {
         pushdown_complex_filter(*bind_data, filters);
     };
+    fn.projection_expression_pushdown = projection_expression_pushdown;
     fn.to_string = to_string;
 
     fn.late_materialization = true;
@@ -211,7 +215,7 @@ duckdb_state register_table_function(DatabaseInstance &db, LogicalType parameter
         return {COLUMN_IDENTIFIER_FILE_INDEX, COLUMN_IDENTIFIER_FILE_ROW_NUMBER};
     };
 
-    fn.statistics = MultiFileFunction<VortexReaderInterface>::MultiFileScanStats;
+    fn.statistics_extended = MultiFileFunction<VortexReaderInterface>::MultiFileScanStatsExtended;
     fn.get_partition_stats = get_partition_stats;
     fn.get_multi_file_reader = get_multi_file_reader;
 
@@ -230,12 +234,12 @@ duckdb_state register_table_function(DatabaseInstance &db, LogicalType parameter
      * disables serialization at all.
      */
     fn.verify_serialization = false;
-    fn.serialize = [](auto &, auto, auto &) {
+    fn.SetSerializeCallback([](auto &, auto, auto &) {
         throw NotImplementedException("Can't serialize Vortex state");
-    };
-    fn.deserialize = [](auto &, auto &) -> unique_ptr<FunctionData> {
+    });
+    fn.SetDeserializeCallback([](auto &, auto &) -> unique_ptr<FunctionData> {
         throw NotImplementedException("Can't deserialize Vortex state");
-    };
+    });
 
     try {
         auto &system_catalog = Catalog::GetSystemCatalog(db);
@@ -257,13 +261,10 @@ extern "C" duckdb_state duckdb_vx_register_version_function(duckdb_database ffi_
     const DatabaseWrapper &wrapper = *reinterpret_cast<DatabaseWrapper *>(ffi_db);
     DatabaseInstance &db = *wrapper.database->instance;
 
-    const string quoted = KeywordHelper::WriteQuoted(version);
+    const string quoted = SQLString::ToString(version);
+    const string definition = "() AS " + quoted;
 
-    const DefaultMacro macro {DEFAULT_SCHEMA,
-                              "vortex_version",
-                              {nullptr},
-                              {{nullptr, nullptr}},
-                              quoted.c_str()};
+    const DefaultMacro macro {DEFAULT_SCHEMA, "vortex_version", definition.c_str()};
     try {
         auto info = DefaultFunctionGenerator::CreateInternalMacroInfo(macro);
         auto &system_catalog = Catalog::GetSystemCatalog(db);

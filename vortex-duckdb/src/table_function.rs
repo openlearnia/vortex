@@ -156,7 +156,12 @@ pub struct AggregateState {
 }
 assert_impl_all!(GlobalState: Send, Sync);
 
-pub type Split = BoxFuture<'static, VortexResult<Option<ArrayRef>>>;
+/// A scan task together with the file-absolute index of its first row. DuckDB
+/// deletion filters need that offset to map emitted rows to file positions.
+pub struct Split {
+    pub row_start: u64,
+    pub task: BoxFuture<'static, VortexResult<Option<ArrayRef>>>,
+}
 
 /// field position, accumulator
 pub type Partials = Vec<(usize, Box<dyn DynAccumulator>)>;
@@ -411,7 +416,8 @@ pub fn pushdown_complex_filter(
 ) -> VortexResult<bool> {
     debug!(%expr, "pushing down expression");
 
-    let Some(expr) = try_from_bound_expression(expr, &bind_data.columns)? else {
+    let Some(expr) = try_from_bound_expression(expr, &bind_data.columns, &bind_data.dtype)?
+    else {
         debug!(%expr, "failed to push down expression");
         return Ok(false);
     };

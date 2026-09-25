@@ -27,6 +27,7 @@ use vortex::scalar_fn::fns::operators::CompareOperator;
 use vortex::scan::selection::Selection;
 use vortex::scan::strict_sorted_buffer::StrictSortedBuffer;
 
+use super::expr::resolve_field_name;
 use super::expr::try_from_bound_expression_with_col_sub;
 use crate::cpp::DUCKDB_VX_EXPR_TYPE;
 use crate::duckdb::ExtractedValue;
@@ -71,6 +72,7 @@ pub fn try_from_table_filter(
         TableFilterClass::IsNull => is_null(col.clone()),
         TableFilterClass::IsNotNull => is_not_null(col.clone()),
         TableFilterClass::StructExtract(name, child_filter) => {
+            let name = resolve_field_name(col, name.to_owned(), Some(scope_dtype));
             return try_from_table_filter(child_filter, &get_item(name, col.clone()), scope_dtype);
         }
         TableFilterClass::Optional(child) => {
@@ -125,7 +127,7 @@ pub fn try_from_table_filter(
             )
         }
         TableFilterClass::ExpressionRef(expr) => {
-            match try_from_bound_expression_with_col_sub(expr, col)? {
+            match try_from_bound_expression_with_col_sub(expr, col, scope_dtype)? {
                 Some(expression) => expression,
                 None => return Ok(None),
             }

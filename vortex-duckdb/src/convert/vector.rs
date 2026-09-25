@@ -10,6 +10,7 @@ use vortex::array::arrays::ExtensionArray;
 use vortex::array::arrays::FixedSizeListArray;
 use vortex::array::arrays::ListViewArray;
 use vortex::array::arrays::MapArray;
+use vortex::array::arrays::NullArray;
 use vortex::array::arrays::PrimitiveArray;
 use vortex::array::arrays::StructArray;
 use vortex::array::arrays::TemporalArray;
@@ -248,11 +249,23 @@ fn uuid_vector_to_vortex(vector: &VectorRef, len: usize) -> VortexResult<ArrayRe
 }
 
 fn hugeint_vector_to_vortex(vector: &VectorRef, len: usize) -> VortexResult<ArrayRef> {
+    let signed = match vector.logical_type().as_type_id() {
+        DUCKDB_TYPE::DUCKDB_TYPE_HUGEINT => true,
+        DUCKDB_TYPE::DUCKDB_TYPE_UHUGEINT => false,
+        other => vortex_bail!("unexpected hugeint logical type {other:?}"),
+    };
     let values = vector.as_slice_with_len::<duckdb_hugeint>(len);
     let mut bytes = BufferMut::<u8>::with_capacity(len * 16);
     for value in values {
-        bytes.extend_from_slice(&value.lower.to_le_bytes());
-        bytes.extend_from_slice(&value.upper.to_le_bytes());
+        // Sign-flipped big-endian halves order like the original integers under
+        // bytewise comparison (same as `vortex.uuid`); UHUGEINT needs no flip.
+        let upper = if signed {
+            (value.upper as u64) ^ (1_u64 << 63)
+        } else {
+            value.upper as u64
+        };
+        bytes.extend_from_slice(&upper.to_be_bytes());
+        bytes.extend_from_slice(&value.lower.to_be_bytes());
     }
     let storage = FixedSizeListArray::try_new(
         PrimitiveArray::new(bytes.freeze(), Validity::NonNullable).into_array(),
@@ -261,22 +274,18 @@ fn hugeint_vector_to_vortex(vector: &VectorRef, len: usize) -> VortexResult<Arra
         len,
     )?
     .into_array();
-    let dtype = match vector.logical_type().as_type_id() {
-        DUCKDB_TYPE::DUCKDB_TYPE_HUGEINT => {
-            ExtDType::<crate::convert::ext_types::DuckHugeInt>::try_new(
-                crate::convert::ext_types::EmptyExtMetadata,
-                storage.dtype().clone(),
-            )?
-            .erased()
-        }
-        DUCKDB_TYPE::DUCKDB_TYPE_UHUGEINT => {
-            ExtDType::<crate::convert::ext_types::DuckUHugeInt>::try_new(
-                crate::convert::ext_types::EmptyExtMetadata,
-                storage.dtype().clone(),
-            )?
-            .erased()
-        }
-        other => vortex_bail!("unexpected hugeint logical type {other:?}"),
+    let dtype = if signed {
+        ExtDType::<crate::convert::ext_types::DuckHugeInt>::try_new(
+            crate::convert::ext_types::EmptyExtMetadata,
+            storage.dtype().clone(),
+        )?
+        .erased()
+    } else {
+        ExtDType::<crate::convert::ext_types::DuckUHugeInt>::try_new(
+            crate::convert::ext_types::EmptyExtMetadata,
+            storage.dtype().clone(),
+        )?
+        .erased()
     };
     Ok(ExtensionArray::try_new(dtype, storage)?.into_array())
 }
@@ -436,6 +445,13 @@ pub fn flat_vector_to_vortex(vector: &VectorRef, len: usize) -> VortexResult<Arr
                     .into_array(),
             )
         }
+        DUCKDB_TYPE::DUCKDB_TYPE_TIMESTAMP_TZ_NS => {
+            let arr = vector_mapped(vector, len, |duckdb_timestamp_ns { nanos }| *nanos);
+            Ok(
+                TemporalArray::new_timestamp(arr, TimeUnit::Nanoseconds, Some("UTC".into()))
+                    .into_array(),
+            )
+        }
         DUCKDB_TYPE::DUCKDB_TYPE_DATE => {
             let arr = vector_mapped(vector, len, |duckdb_date { days }| *days);
             Ok(TemporalArray::new_date(arr, TimeUnit::Days).into_array())
@@ -488,6 +504,7 @@ pub fn flat_vector_to_vortex(vector: &VectorRef, len: usize) -> VortexResult<Arr
             )
             .into_array())
         }
+        DUCKDB_TYPE::DUCKDB_TYPE_SQLNULL => Ok(NullArray::new(len).into_array()),
         DUCKDB_TYPE::DUCKDB_TYPE_TINYINT => Ok(vector_as_slice::<i8>(vector, len)),
         DUCKDB_TYPE::DUCKDB_TYPE_SMALLINT => Ok(vector_as_slice::<i16>(vector, len)),
         DUCKDB_TYPE::DUCKDB_TYPE_INTEGER => Ok(vector_as_slice::<i32>(vector, len)),
@@ -525,28 +542,6 @@ pub fn flat_vector_to_vortex(vector: &VectorRef, len: usize) -> VortexResult<Arr
                 _ => vortex_bail!("Unsupported decimal precision: {precision}"),
             }
             .map(|a| a.into_array())
-        }
-        DUCKDB_TYPE::DUCKDB_TYPE_UUID => {
-            let mut bytes = BufferMut::<u8>::with_capacity(len * 16);
-            for v in vector_i128_values(vector, len) {
-                let be = (v as u128) ^ (1u128 << 127);
-                bytes.extend_from_slice(&be.to_be_bytes());
-            }
-
-            let storage = FixedSizeListArray::try_new(
-                PrimitiveArray::new(bytes.freeze(), Validity::NonNullable).into_array(),
-                16,
-                vector.validity_ref(len).to_validity(),
-                len,
-            )?;
-            let ext_dtype = ExtDType::<Uuid>::try_with_vtable(
-                Uuid,
-                UuidMetadata::default(),
-                storage.dtype().clone(),
-            )?
-            .erased();
-
-            Ok(ExtensionArray::try_new(ext_dtype, storage.into_array())?.into_array())
         }
         DUCKDB_TYPE::DUCKDB_TYPE_ARRAY => {
             let array_elem_size = vector.logical_type().array_type_array_size();
@@ -1031,6 +1026,78 @@ mod tests {
             .unwrap();
 
         assert_eq!(values.as_slice::<u8>(), &bytes);
+    }
+
+    #[test]
+    fn test_hugeint_vector_conversion() {
+        let mut ctx = array_session().create_execution_ctx();
+        // A negative value exercises the order-preserving sign flip.
+        let value = -1i128;
+        let bytes = value.to_be_bytes();
+        let mut vector =
+            Vector::with_capacity(&LogicalType::new(DUCKDB_TYPE::DUCKDB_TYPE_HUGEINT), 1);
+        unsafe {
+            vector.as_slice_mut::<duckdb_hugeint>(1)[0] = duckdb_hugeint {
+                lower: u64::from_be_bytes(bytes[8..].try_into().unwrap()),
+                upper: i64::from_be_bytes(bytes[..8].try_into().unwrap()),
+            };
+        }
+
+        let result = flat_vector_to_vortex(&vector, 1).unwrap();
+        let extension = result.as_opt::<Extension>().unwrap().into_owned();
+        assert_eq!(
+            extension.ext_dtype().id().as_ref(),
+            crate::convert::ext_types::HUGEINT_EXT_ID
+        );
+        let storage = extension
+            .storage_array()
+            .clone()
+            .execute::<FixedSizeListArray>(&mut ctx)
+            .unwrap();
+        let values = storage
+            .elements()
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)
+            .unwrap();
+
+        assert_eq!(
+            values.as_slice::<u8>(),
+            &(value as u128 ^ (1u128 << 127)).to_be_bytes()
+        );
+    }
+
+    #[test]
+    fn test_uhugeint_vector_conversion() {
+        let mut ctx = array_session().create_execution_ctx();
+        let value = u128::MAX;
+        let bytes = value.to_be_bytes();
+        let mut vector =
+            Vector::with_capacity(&LogicalType::new(DUCKDB_TYPE::DUCKDB_TYPE_UHUGEINT), 1);
+        unsafe {
+            vector.as_slice_mut::<duckdb_hugeint>(1)[0] = duckdb_hugeint {
+                lower: u64::from_be_bytes(bytes[8..].try_into().unwrap()),
+                upper: i64::from_be_bytes(bytes[..8].try_into().unwrap()),
+            };
+        }
+
+        let result = flat_vector_to_vortex(&vector, 1).unwrap();
+        let extension = result.as_opt::<Extension>().unwrap().into_owned();
+        assert_eq!(
+            extension.ext_dtype().id().as_ref(),
+            crate::convert::ext_types::UHUGEINT_EXT_ID
+        );
+        let storage = extension
+            .storage_array()
+            .clone()
+            .execute::<FixedSizeListArray>(&mut ctx)
+            .unwrap();
+        let values = storage
+            .elements()
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)
+            .unwrap();
+
+        assert_eq!(values.as_slice::<u8>(), &value.to_be_bytes());
     }
 
     #[test]

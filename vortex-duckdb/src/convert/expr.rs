@@ -112,6 +112,44 @@ fn from_bound_f64(value: &duckdb::ExpressionRef) -> VortexResult<Option<f64>> {
     }
 }
 
+/// Read a `usize` from a constant expression (the `struct_extract_at` index); `None` for
+/// non-constants.
+fn from_bound_usize(value: &duckdb::ExpressionRef) -> VortexResult<Option<usize>> {
+    match value.as_class().vortex_expect("unknown class") {
+        BoundConstant(constant) => {
+            Ok(Some(usize::try_from(&Scalar::try_from(constant.value)?)?))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// DuckDB struct field names are case-insensitive; map `name` to the field's actual name in
+/// the child's struct dtype when known, preferring an exact match.
+pub(super) fn resolve_field_name(
+    child: &Expression,
+    name: String,
+    scope_dtype: Option<&DType>,
+) -> String {
+    let Some(dtype) = scope_dtype.and_then(|scope| child.return_dtype(scope).ok()) else {
+        return name;
+    };
+    let DType::Struct(fields, _) = dtype else {
+        return name;
+    };
+    fields
+        .names()
+        .iter()
+        .find(|n| n.as_ref() == name.as_str())
+        .or_else(|| {
+            fields
+                .names()
+                .iter()
+                .find(|n| n.as_ref().eq_ignore_ascii_case(name.as_str()))
+        })
+        .map(|n| n.as_ref().to_owned())
+        .unwrap_or(name)
+}
+
 /// Context threaded through expression conversion.
 #[derive(Clone, Copy)]
 struct ConvertCtx<'a> {
@@ -119,6 +157,9 @@ struct ConvertCtx<'a> {
     col_sub: Option<&'a Expression>,
     /// The scan's fields, when known.
     fields: Option<&'a [DuckdbField]>,
+    /// The file's dtype, needed to resolve positional struct extracts (`struct_extract_at`)
+    /// to field names.
+    scope_dtype: Option<&'a DType>,
 }
 
 /// Whether `name` is a non-nullable native geometry column of the scan. The pushed spatial kernels
@@ -270,7 +311,33 @@ fn try_from_bound_function(
                 return Ok(None);
             };
             let field = from_bound_str(children[1])?;
-            get_item(field, child)
+            get_item(resolve_field_name(&child, field, ctx.scope_dtype), child)
+        }
+        // `struct_extract_at(struct, i)` takes a 1-based position; the multi-file column
+        // mapper emits it for filters on struct fields under schema evolution. Resolve the
+        // position to a field name in the file's struct dtype.
+        "struct_extract_at" => {
+            let children: Vec<_> = func.children().collect();
+            vortex_ensure!(children.len() == 2);
+            let Some(child) = try_from_expression_inner(children[0], ctx)? else {
+                return Ok(None);
+            };
+            let Some(index) = from_bound_usize(children[1])? else {
+                return Ok(None);
+            };
+            let Some(scope_dtype) = ctx.scope_dtype else {
+                return Ok(None);
+            };
+            let DType::Struct(fields, _) = child.return_dtype(scope_dtype)? else {
+                return Ok(None);
+            };
+            let Some(field) = index
+                .checked_sub(1)
+                .and_then(|index| fields.field_name(index))
+            else {
+                return Ok(None);
+            };
+            get_item(field.clone(), child)
         }
         like @ ("~~" | "!~~") => {
             let children: Vec<_> = func.children().collect();
@@ -333,6 +400,9 @@ fn try_from_bound_function(
                 return Ok(None);
             }
         }
+        // Always true at row level; the real optional-filter hint lives in the
+        // function's bind data, which we cannot see.
+        "__internal_tablefilter_optional" => lit(true),
         // Spatial UDFs are handled here; non-spatial names return `None` inside.
         name => return try_from_spatial_function(name, func, ctx),
     };
@@ -343,12 +413,14 @@ fn try_from_bound_function(
 pub fn try_from_bound_expression(
     value: &duckdb::ExpressionRef,
     fields: &[DuckdbField],
+    scope_dtype: &DType,
 ) -> VortexResult<Option<Expression>> {
     try_from_expression_inner(
         value,
         ConvertCtx {
             col_sub: None,
             fields: Some(fields),
+            scope_dtype: Some(scope_dtype),
         },
     )
 }
@@ -356,6 +428,7 @@ pub fn try_from_bound_expression(
 pub(super) fn try_from_bound_expression_with_col_sub(
     value: &duckdb::ExpressionRef,
     col_sub: &Expression,
+    scope_dtype: &DType,
 ) -> VortexResult<Option<Expression>> {
     // No fields: scan-time table filters never carry spatial functions, because
     // `can_push_expression` refuses them.
@@ -364,6 +437,7 @@ pub(super) fn try_from_bound_expression_with_col_sub(
         ConvertCtx {
             col_sub: Some(col_sub),
             fields: None,
+            scope_dtype: Some(scope_dtype),
         },
     )
 }
@@ -420,6 +494,7 @@ pub fn can_push_expression(value: &duckdb::ExpressionRef) -> bool {
         ExpressionClass::BoundFunction(func) => {
             let name = func.scalar_function.name();
             name == "struct_extract"
+                || name == "struct_extract_at"
                 || name == "contains"
                 || name == "prefix"
                 || name == "suffix"
@@ -427,6 +502,7 @@ pub fn can_push_expression(value: &duckdb::ExpressionRef) -> bool {
                 || name == "!~~"
                 || name == "strlen"
                 || name == "array_length"
+                || name == "__internal_tablefilter_optional"
                 || (matches!(name, "len" | "length") && is_supported_length_alias(&func))
             // Spatial functions are absent on purpose: they push only via
             // `pushdown_complex_filter`, which has the scan's fields to verify the geometry

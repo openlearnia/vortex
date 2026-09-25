@@ -370,7 +370,12 @@ impl<A: 'static + Send> ScanBuilder<A> {
             return Ok(vec![]);
         }
 
-        self.prepare()?.execute(None)
+        Ok(self
+            .prepare()?
+            .execute(None)?
+            .into_iter()
+            .map(|(_, task)| task)
+            .collect())
     }
 
     /// Returns a [`Stream`] with tasks spawned onto the session's runtime handle.
@@ -397,7 +402,7 @@ enum LazyScanState<A: 'static + Send> {
     Error(Option<vortex_error::VortexError>),
 }
 
-type PreparedScanTasks<A> = Vec<BoxFuture<'static, VortexResult<Option<A>>>>;
+type PreparedScanTasks<A> = Vec<(Range<u64>, BoxFuture<'static, VortexResult<Option<A>>>)>;
 
 struct PreparingScan<A: 'static + Send> {
     ordered: bool,
@@ -448,7 +453,7 @@ impl<A: 'static + Send> Stream for LazyScanStream<A> {
                             let concurrency = preparing.concurrency;
                             let handle = preparing.handle.clone();
                             let stream =
-                                futures::stream::iter(tasks).map(move |task| handle.spawn(task));
+                                futures::stream::iter(tasks).map(move |(_, task)| handle.spawn(task));
                             let stream = if ordered {
                                 stream.buffered(concurrency).boxed()
                             } else {

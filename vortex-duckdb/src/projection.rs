@@ -192,6 +192,9 @@ pub struct Filter {
     pub row_selection: Selection,
     pub row_range: Option<Range<u64>>,
     pub has_non_optional_filter: bool,
+    /// A non-optional table filter could not be converted and was dropped; the
+    /// caller must re-apply the scan's filters itself.
+    pub dropped_any: bool,
 }
 
 fn push_filter_expr(filter_exprs: &mut Vec<Expression>, expr: &Expression) {
@@ -211,6 +214,7 @@ impl Filter {
         dtype: &DType,
     ) -> VortexResult<Self> {
         let mut has_non_optional_filter = false;
+        let mut dropped_any = false;
 
         let mut table_filter_exprs = Vec::new();
         if let Some(filter) = table_filter_set {
@@ -218,13 +222,19 @@ impl Filter {
                 let idx_u: usize = idx.as_();
                 !is_virtual_column(column_ids[idx_u])
             }) {
-                has_non_optional_filter |= !matches!(ex.as_class(), TableFilterClass::Optional(_));
+                let is_optional = matches!(ex.as_class(), TableFilterClass::Optional(_));
+                has_non_optional_filter |= !is_optional;
 
                 let idx_u: usize = idx.as_();
                 let col_idx: usize = column_ids[idx_u].as_();
                 let name = &column_fields.get(col_idx).vortex_expect("exists").name;
-                if let Some(expr) = try_from_table_filter(ex, &col(name.as_str()), dtype)? {
+                let converted = try_from_table_filter(ex, &col(name.as_str()), dtype)?;
+                if let Some(expr) = converted {
                     push_filter_expr(&mut table_filter_exprs, &expr);
+                } else if !is_optional {
+                    // Optional filters are hints and safe to skip; a dropped
+                    // non-optional filter must be re-applied by the caller.
+                    dropped_any = true;
                 }
             }
         }
@@ -253,6 +263,7 @@ impl Filter {
             row_selection,
             row_range,
             has_non_optional_filter,
+            dropped_any,
         };
         Ok(out)
     }

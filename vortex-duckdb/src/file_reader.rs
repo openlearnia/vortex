@@ -214,20 +214,26 @@ pub fn reader_initialize(file: &mut OpenFileReader, global: &GlobalState) -> Vor
     // threads take last element of file.splits so we need to reverse
     splits.reverse();
     file.total_splits = splits.len();
-    file.splits = splits;
+    file.splits = splits
+        .into_iter()
+        .map(|(row_range, task)| Split {
+            row_start: row_range.start,
+            task,
+        })
+        .collect();
     Ok(false)
 }
 
-/// Called by all threads under global lock. If this function returns true,
-/// thread calls reader_scan on this file. If this function returns false,
-/// duckdb thinks file is exhausted, closes the file, and the first thread to
-/// get "false" switches to next file.
-pub fn reader_try_initialize_scan(file: &mut OpenFileReader, local: &mut LocalState) -> bool {
-    let Some(split) = file.splits.pop() else {
-        return false;
-    };
+/// Called by all threads under global lock. If this function returns Some,
+/// thread calls reader_scan on this file and the value is the file row index
+/// of the claimed split's first row. If this function returns None, duckdb
+/// thinks file is exhausted, closes the file, and the first thread to get
+/// "None" switches to next file.
+pub fn reader_try_initialize_scan(file: &mut OpenFileReader, local: &mut LocalState) -> Option<u64> {
+    let split = file.splits.pop()?;
+    let row_start = split.row_start;
     local.split = Some(split);
-    true
+    Some(row_start)
 }
 
 /// Called by all threads operating on a file without locks. If this function
@@ -247,7 +253,7 @@ pub fn reader_scan(
         let Some(split) = local.split.take() else {
             return Ok(false);
         };
-        let Some(array) = RUNTIME.block_on(split)? else {
+        let Some(array) = RUNTIME.block_on(split.task)? else {
             // split is filtered
             return Ok(true);
         };
@@ -268,7 +274,7 @@ fn reader_scan_aggregate(global: &GlobalState, local: &mut LocalState) -> Vortex
     let Some(split) = local.split.take() else {
         return Ok(false);
     };
-    let Some(array) = RUNTIME.block_on(split)? else {
+    let Some(array) = RUNTIME.block_on(split.task)? else {
         // split is filtered
         return Ok(true);
     };

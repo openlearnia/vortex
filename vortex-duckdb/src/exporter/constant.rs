@@ -45,21 +45,23 @@ pub fn new_exporter_with_mask(
         ));
     }
 
+    if is_custom_extension(array.scalar().dtype()) {
+        return canonical::new_exporter(array.into_array(), cache, ctx);
+    }
+
     new_exporter(array)
 }
 
-pub(crate) fn new_exporter_with_flatten(
-    array: ConstantArray,
-    cache: &ConversionCache,
-    ctx: &mut ExecutionCtx,
-    flatten: bool,
-) -> VortexResult<Box<dyn ColumnExporter>> {
-    let custom_extension = matches!(
-        array.scalar().dtype(),
+/// Extension dtypes without a `try_to_duckdb_scalar` conversion must be
+/// exported through the canonical path, which decodes their storage directly.
+fn is_custom_extension(dtype: &DType) -> bool {
+    matches!(
+        dtype,
         DType::Extension(ext)
             if matches!(
                 ext.id().as_ref(),
-                crate::convert::ext_types::INTERVAL_EXT_ID
+                "vortex.uuid"
+                    | crate::convert::ext_types::INTERVAL_EXT_ID
                     | crate::convert::ext_types::ENUM_EXT_ID
                     | crate::convert::ext_types::BIT_EXT_ID
                     | crate::convert::ext_types::BIGNUM_EXT_ID
@@ -68,8 +70,17 @@ pub(crate) fn new_exporter_with_flatten(
                     | crate::convert::ext_types::VARIANT_EXT_ID
                     | crate::convert::ext_types::TIME_TZ_EXT_ID
             )
-    );
-    if flatten || custom_extension || array.scalar().dtype().is_nested() {
+    )
+}
+
+pub(crate) fn new_exporter_with_flatten(
+    array: ConstantArray,
+    cache: &ConversionCache,
+    ctx: &mut ExecutionCtx,
+    flatten: bool,
+) -> VortexResult<Box<dyn ColumnExporter>> {
+    if flatten || is_custom_extension(array.scalar().dtype()) || array.scalar().dtype().is_nested()
+    {
         return canonical::new_exporter(array.into_array(), cache, ctx);
     }
     new_exporter(array)

@@ -29,6 +29,10 @@ void duckdb_vx_vector_set_all_valid(duckdb_vector ffi_vector);
 // Set the data pointer for the vector. This is the start of the values array in the vector.
 void duckdb_vx_vector_set_data_ptr(duckdb_vector ffi_vector, void *ptr);
 
+// Set the logical cardinality of a data chunk without resizing its child vectors.
+// Exported vectors can be dictionary vectors, which SetChildCardinality refuses to resize.
+void duckdb_vx_data_chunk_set_size(duckdb_data_chunk ffi_chunk, idx_t size);
+
 // Converts a duckdb flat vector into a Sequence vector.
 void duckdb_vx_sequence_vector(duckdb_vector c_vector, int64_t start, int64_t step, idx_t capacity);
 

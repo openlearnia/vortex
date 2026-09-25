@@ -61,6 +61,10 @@ fn new_hugeint_exporter(
     ext: ExtensionArray,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Box<dyn ColumnExporter>> {
+    // Storage bytes are sign-flipped big-endian for signed HUGEINT and plain
+    // big-endian for UHUGEINT (see `hugeint_vector_to_vortex`).
+    let signed =
+        ext.ext_dtype().is::<DuckHugeInt>() || ext.ext_dtype().id().as_ref() == HUGEINT_EXT_ID;
     let storage = ext
         .storage_array()
         .clone()
@@ -75,9 +79,20 @@ fn new_hugeint_exporter(
     let values = bytes
         .as_slice::<u8>()
         .chunks_exact(16)
-        .map(|bytes| cpp::duckdb_hugeint {
-            lower: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
-            upper: i64::from_le_bytes(bytes[8..].try_into().unwrap()),
+        .map(|bytes| {
+            let mut upper_bytes = [0u8; 8];
+            upper_bytes.copy_from_slice(&bytes[..8]);
+            let upper = u64::from_be_bytes(upper_bytes);
+            let mut lower_bytes = [0u8; 8];
+            lower_bytes.copy_from_slice(&bytes[8..]);
+            cpp::duckdb_hugeint {
+                lower: u64::from_be_bytes(lower_bytes),
+                upper: if signed {
+                    (upper ^ (1_u64 << 63)) as i64
+                } else {
+                    upper as i64
+                },
+            }
         })
         .collect();
     Ok(validity::new_exporter(

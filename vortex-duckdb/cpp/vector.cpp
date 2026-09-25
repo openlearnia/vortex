@@ -4,8 +4,13 @@
 #include "vector.h"
 #include "vector.hpp"
 
+#include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/constant_vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/fsst_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 
 using namespace duckdb;
 
@@ -32,24 +37,15 @@ duckdb_vx_sequence_vector(duckdb_vector c_vector, int64_t start, int64_t step, i
     vector->Sequence(start, step, capacity);
 }
 
-// This is a complete hack to access the data buffer and pointer of a vector.
-// Duckdb passes us Vectors and not VortexVectors. This only works because
-// VortexVector doesn't add any members.
-class VortexVector final : public Vector {
+// StandardVectorBuffer stores data_ptr as a protected member. This adds no
+// members, so the downcast only exposes write access to it.
+class ExternalStandardBuffer final : public StandardVectorBuffer {
 public:
-    inline void SetDataBuffer(buffer_ptr<VectorBuffer> new_buffer) {
-        buffer = std::move(new_buffer);
-    };
-
     inline void SetDataPtr(data_ptr_t ptr) {
-        data = ptr;
-    };
-
-    inline ValidityMask &GetValidity() {
-        return validity;
+        data_ptr = ptr;
     };
 };
-static_assert(sizeof(VortexVector) == sizeof(Vector));
+static_assert(sizeof(ExternalStandardBuffer) == sizeof(StandardVectorBuffer));
 
 // Same hack for ValidityMask: access protected fields via inheritance.
 class ExternalValidityMask final : public ValidityMask {
@@ -67,21 +63,26 @@ extern "C" void duckdb_vx_string_vector_add_vector_data_buffer(duckdb_vector ffi
                                                                duckdb_vx_vector_buffer buffer) {
     auto vector = reinterpret_cast<Vector *>(ffi_vector);
     auto data = reinterpret_cast<shared_ptr<ExternalVectorBuffer> *>(buffer);
-    StringVector::AddBuffer(*vector, *data);
+    StringVector::AddAuxiliaryData(*vector, make_uniq<ExternalVectorBufferHolder>(*data));
 }
 
 extern "C" void duckdb_vx_vector_set_vector_data_buffer(duckdb_vector ffi_vector,
                                                         duckdb_vx_vector_buffer buffer) {
     auto vector = reinterpret_cast<Vector *>(ffi_vector);
-    auto dvector = reinterpret_cast<VortexVector *>(vector);
     auto data = reinterpret_cast<shared_ptr<ExternalVectorBuffer> *>(buffer);
-    dvector->SetDataBuffer(*data);
+    vector->BufferMutable().AddAuxiliaryData(make_uniq<ExternalVectorBufferHolder>(*data));
 }
 
 extern "C" void duckdb_vx_vector_set_data_ptr(duckdb_vector ffi_vector, void *ptr) {
     auto vector = reinterpret_cast<Vector *>(ffi_vector);
-    auto dvector = reinterpret_cast<VortexVector *>(vector);
-    dvector->SetDataPtr((data_ptr_t)ptr);
+    // The data pointer lives on the StandardVectorBuffer (flat, string, and
+    // list buffers all derive from it). Nested types without a data pointer
+    // (e.g. structs) never take this path.
+    auto standard_buffer = dynamic_cast<StandardVectorBuffer *>(&vector->BufferMutable());
+    if (standard_buffer == nullptr) {
+        throw InternalException("duckdb_vx_vector_set_data_ptr requires a standard vector buffer");
+    }
+    static_cast<ExternalStandardBuffer *>(standard_buffer)->SetDataPtr((data_ptr_t)ptr);
 }
 
 extern "C" void duckdb_vx_vector_set_validity_data(duckdb_vector ffi_vector,
@@ -89,8 +90,8 @@ extern "C" void duckdb_vx_vector_set_validity_data(duckdb_vector ffi_vector,
                                                    idx_t capacity,
                                                    duckdb_vx_vector_buffer buffer,
                                                    void *data_ptr) {
-    auto dvector = reinterpret_cast<VortexVector *>(ffi_vector);
-    auto &validity = dvector->GetValidity();
+    auto vector = reinterpret_cast<Vector *>(ffi_vector);
+    auto &validity = vector->BufferMutable().GetValidityMask();
     // ExternalValidityMask adds no members, so this downcast only exposes
     // access to ValidityMask's protected fields.
     auto ext_validity = static_cast<ExternalValidityMask *>(&validity);
@@ -99,9 +100,9 @@ extern "C" void duckdb_vx_vector_set_validity_data(duckdb_vector ffi_vector,
     // ExternalVectorBuffer (preventing the Rust buffer from being freed),
     // while the stored pointer points to the explicit data_ptr.
     auto ext_buf = reinterpret_cast<shared_ptr<ExternalVectorBuffer> *>(buffer);
-    auto keeper = shared_ptr<TemplatedValidityData<validity_t>>(
+    auto keeper = buffer_ptr<ExternalValidityMask::ValidityBuffer>(
         *ext_buf,
-        reinterpret_cast<TemplatedValidityData<validity_t> *>(data_ptr));
+        reinterpret_cast<ExternalValidityMask::ValidityBuffer *>(data_ptr));
 
     // Set validity_data, derive validity_mask from it at u64_offset, and set capacity.
     ext_validity->SetExternal(u64_offset, capacity, std::move(keeper));
@@ -113,9 +114,14 @@ extern "C" duckdb_value duckdb_vx_vector_get_value(duckdb_vector ffi_vector, idx
     return reinterpret_cast<duckdb_value>(value.release());
 }
 
-void duckdb_vector_flatten(duckdb_vector vector, unsigned long len) {
+void duckdb_vector_flatten(duckdb_vector vector, unsigned long) {
     auto dvector = reinterpret_cast<Vector *>(vector);
-    dvector->Flatten(len);
+    dvector->Flatten();
+}
+
+void duckdb_vx_data_chunk_set_size(duckdb_data_chunk ffi_chunk, idx_t size) {
+    auto chunk = reinterpret_cast<DataChunk *>(ffi_chunk);
+    chunk->SetCardinalityUnsafe(size);
 }
 
 void duckdb_vx_vector_set_all_valid(duckdb_vector ffi_vector) {
@@ -127,7 +133,7 @@ void duckdb_vx_vector_set_all_valid(duckdb_vector ffi_vector) {
     case CONSTANT_VECTOR:
         return ConstantVector::Validity(vector).Reset();
     case FLAT_VECTOR:
-        return FlatVector::Validity(vector).Reset();
+        return FlatVector::ValidityMutable(vector).Reset();
     case FSST_VECTOR:
         return FSSTVector::Validity(vector).Reset();
     default:
