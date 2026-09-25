@@ -16,21 +16,32 @@
 //! The token ids returned index the trained dictionary, so the emitted code
 //! stream is interchangeable with the crate's own parse.
 
+// `load_window`/`load_le_u64` build a `u64` from a fixed-width slice, so the
+// `try_into` conversions below are infallible by construction. Mirrors the
+// same helpers in the upstream `onpair` crate's `lpm` module.
+#![allow(clippy::unwrap_used)]
+
 use hashbrown::HashMap;
 use onpair::CompactDictionaryView;
 use onpair::DictionaryView;
 use onpair::Token;
 use rustc_hash::FxBuildHasher;
+use vortex_error::vortex_panic;
 
 /// Tokens of this length or shorter live in the short table; longer tokens are
 /// bucketed by their 8-byte prefix.
 const PREFIX_LEN: usize = 8;
 
-/// Maximum dictionary token size.
-const MAX_TOKEN: usize = 16;
+/// Maximum dictionary token size, taken from the upstream crate so a bump there
+/// cannot silently desync the tables built here.
+const MAX_TOKEN: usize = onpair::MAX_TOKEN_SIZE;
 
 /// Maximum suffix length for long tokens.
 const MAX_SUFFIX: usize = MAX_TOKEN - PREFIX_LEN;
+
+// `present`/`short_len_mask` index a suffix length in a `u16`, so a wider token
+// size would silently drop bits instead of failing to compile.
+const _: () = assert!(MAX_SUFFIX < u16::BITS as usize);
 
 /// Loads the first up-to-16 bytes of `data` as two little-endian `u64`s.
 /// For `8 < n < 16` an overlapping tail load realigns bytes `n - 8..n` so the
@@ -96,21 +107,36 @@ struct LongEntry {
     token: Token,
 }
 
-/// Long tokens sharing an 8-byte prefix, grouped by suffix length.
+/// Bucket width past which the grouped binary search beats a linear scan.
+const PROMOTE_THRESHOLD: usize = 48;
+
+/// Long tokens sharing an 8-byte prefix.
 ///
-/// `present` holds a bit per suffix length; `entries` is sorted by suffix
-/// length descending then by suffix, with `ends[s]`/`ends[s + 1]` bracketing
-/// each length's group.
-struct LongBucket {
-    entries: Vec<LongEntry>,
-    ends: [u32; MAX_SUFFIX + 2],
-    present: u16,
+/// Narrow buckets — the overwhelming majority on real text, where most 8-byte
+/// prefixes are unique — stay on a linear scan. One XOR plus a trailing-zero
+/// count per entry beats binary search once the bucket is only a few entries
+/// wide, and the grouped form's `ends` indirection never pays for itself there.
+enum LongBucket {
+    /// Suffix-length-descending, so the first hit is the longest match.
+    Linear(Vec<LongEntry>),
+    /// `present` holds a bit per suffix length; `entries` is sorted by suffix
+    /// length descending then by suffix, with `ends[s]`/`ends[s + 1]`
+    /// bracketing each length's group.
+    Grouped {
+        entries: Vec<LongEntry>,
+        ends: [u32; MAX_SUFFIX + 2],
+        present: u16,
+    },
 }
 
 impl LongBucket {
     fn build(entries: Vec<LongEntry>) -> Self {
         let mut entries = entries;
         entries.sort_unstable_by(|a, b| b.slen.cmp(&a.slen).then(a.suffix.cmp(&b.suffix)));
+
+        if entries.len() <= PROMOTE_THRESHOLD {
+            return LongBucket::Linear(entries);
+        }
 
         let mut ends = [0u32; MAX_SUFFIX + 2];
         let mut present = 0u16;
@@ -124,7 +150,7 @@ impl LongBucket {
             acc += counts[slen];
             ends[slen] = acc;
         }
-        Self {
+        LongBucket::Grouped {
             entries,
             ends,
             present,
@@ -134,23 +160,41 @@ impl LongBucket {
     /// Longest bucket token whose `slen` suffix bytes prefix `val`'s low bytes.
     #[inline]
     fn find(&self, val: u64, max_slen: usize) -> Option<(Token, usize)> {
-        let mut lens = self.present & ((1u16 << (max_slen + 1)) - 1);
-        while lens != 0 {
-            let slen = (u16::BITS - 1 - lens.leading_zeros()) as usize;
-            lens &= !(1u16 << slen);
+        let Self::Linear(entries) = self else {
+            let Self::Grouped {
+                entries,
+                ends,
+                present,
+            } = self
+            else {
+                unreachable!()
+            };
+            let mut lens = *present & ((1u16 << (max_slen + 1)) - 1);
+            while lens != 0 {
+                let slen = (u16::BITS - 1 - lens.leading_zeros()) as usize;
+                lens &= !(1u16 << slen);
 
-            let group = &self.entries[self.ends[slen + 1] as usize..self.ends[slen] as usize];
-            let target = val & mask_u64(slen);
-            if let Ok(i) = group.binary_search_by_key(&target, |e| e.suffix) {
-                return Some((group[i].token, slen));
+                let group = &entries[ends[slen + 1] as usize..ends[slen] as usize];
+                let target = val & mask_u64(slen);
+                if let Ok(i) = group.binary_search_by_key(&target, |e| e.suffix) {
+                    return Some((group[i].token, slen));
+                }
             }
-        }
-        None
+            return None;
+        };
+
+        // Entries are suffix-length-descending, so the first match is longest.
+        entries.iter().find_map(|e| {
+            let elen = e.slen as usize;
+            // Matching low bytes = trailing-zero bytes of the XOR.
+            (elen <= max_slen && ((val ^ e.suffix).trailing_zeros() >> 3) as usize >= elen)
+                .then_some((e.token, elen))
+        })
     }
 }
 
 /// Longest-prefix matcher over a finished dictionary.
-pub(crate) struct FastLpm {
+pub struct FastLpm {
     /// Tokens of length `2..=8` keyed by (packed bytes, length). Length-1
     /// tokens are served by `single` instead.
     short: HashMap<(u64, u8), Token, FxBuildHasher>,
@@ -165,7 +209,12 @@ pub(crate) struct FastLpm {
 
 impl FastLpm {
     /// Builds a matcher over a trained dictionary's token view.
-    pub(crate) fn from_dictionary(dict: CompactDictionaryView<'_>) -> Self {
+    ///
+    /// The dictionary must contain all 256 single-byte tokens (the upstream
+    /// trainer always emits them first). Without them the `single` fallback
+    /// would resolve to token 0 and emit a wrong code stream, so this panics
+    /// rather than corrupting output the way the array-initialized table would.
+    pub fn from_dictionary(dict: CompactDictionaryView<'_>) -> Self {
         let n = dict.num_tokens();
         let mut me = Self {
             short: HashMap::with_capacity_and_hasher(n, FxBuildHasher),
@@ -175,6 +224,7 @@ impl FastLpm {
         };
         let mut long_entries: HashMap<u64, Vec<LongEntry>, FxBuildHasher> =
             HashMap::with_hasher(FxBuildHasher);
+        let mut singles = 0u16;
         for i in 0..n {
             let token = i as Token;
             let t = dict.token(token);
@@ -182,6 +232,7 @@ impl FastLpm {
             let len = t.len();
             if len == 1 {
                 me.single[t[0] as usize] = token;
+                singles += 1;
             } else if len <= PREFIX_LEN {
                 me.short.insert((load_le_u64(t, len), len as u8), token);
                 me.short_len_mask[t[0] as usize] |= 1u16 << len;
@@ -194,6 +245,9 @@ impl FastLpm {
                     token,
                 });
             }
+        }
+        if singles != 256 {
+            vortex_panic!("OnPair dictionary has {singles} single-byte tokens, expected 256");
         }
         me.long.reserve(long_entries.len());
         for (prefix, entries) in long_entries {
@@ -210,7 +264,7 @@ impl FastLpm {
     ///
     /// `data` must be non-empty.
     #[inline]
-    pub(crate) fn find_longest_match(&self, data: &[u8]) -> (Token, usize) {
+    pub fn find_longest_match(&self, data: &[u8]) -> (Token, usize) {
         let (lo64, hi64) = load_window(data);
         let win = data.len().min(MAX_TOKEN);
 
@@ -239,7 +293,7 @@ impl FastLpm {
 
 /// Tokenizes all rows against `lpm`, returning the code stream and row code
 /// offsets. Equivalent to `onpair::Parser::parse_rows`, minus the matcher cost.
-pub(crate) fn parse_rows<R: onpair::Rows + ?Sized, O: onpair::Offset>(
+pub fn parse_rows<R: onpair::Rows + ?Sized, O: onpair::Offset>(
     lpm: &FastLpm,
     rows: &R,
 ) -> (Vec<Token>, Vec<O>) {

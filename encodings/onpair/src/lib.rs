@@ -14,7 +14,11 @@ mod canonical;
 mod compress;
 mod compute;
 mod decode;
-mod fast_lpm;
+/// Longest-prefix matcher used by the encode path. Public so
+/// `benches/encode.rs` can A/B it against the upstream parser on one shared
+/// trained dictionary; not a stable API.
+#[doc(hidden)]
+pub mod fast_lpm;
 mod kernel;
 mod ops;
 mod rules;
