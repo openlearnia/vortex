@@ -4,6 +4,7 @@
 //! Train + compress entry points for the OnPair encoding.
 
 use onpair::Config;
+use onpair::Dictionary;
 use onpair::Rows;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
@@ -81,8 +82,17 @@ pub fn onpair_compress(
         lengths: uncompressed_lengths.as_slice(),
         total_bytes,
     };
-    let column = onpair::compress_rows::<_, u64>(&rows, config);
-    let (dict, codes, row_offsets) = column.into_raw();
+    let parser = onpair::Parser::train_rows(&rows, config);
+    // The trained dictionary is shared; only the greedy match loop differs,
+    // and `parse_rows` emits the same code stream as `Parser::parse_rows`.
+    let lpm = crate::fast_lpm::FastLpm::from_dictionary(parser.dict.as_view());
+    let (codes, row_offsets) = crate::fast_lpm::parse_rows::<_, u64>(&lpm, &rows);
+    let (dict, codes, row_offsets) = onpair::Column {
+        dict: parser.dict,
+        codes,
+        row_offsets,
+    }
+    .into_raw();
     let (dict_bytes, dict_offsets) = dict.into_raw();
     let codes_offsets = codes_offsets_array(&row_offsets);
     let codes = Buffer::from(codes).into_array();

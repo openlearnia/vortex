@@ -14,6 +14,7 @@ mod canonical;
 mod compress;
 mod compute;
 mod decode;
+mod fast_lpm;
 mod kernel;
 mod ops;
 mod rules;

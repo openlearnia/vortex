@@ -11657,10 +11657,12 @@ name = "vortex-onpair"
 version = "0.1.0"
 dependencies = [
  "codspeed-divan-compat",
+ "hashbrown 0.17.1",
  "num-traits",
  "onpair",
  "prost 0.14.4",
  "rstest",
+ "rustc-hash",
  "vortex-array",
  "vortex-buffer",
  "vortex-error",
