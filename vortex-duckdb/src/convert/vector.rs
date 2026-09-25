@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::sync::Arc;
+
 use num_traits::AsPrimitive;
 use vortex::array::ArrayRef;
 use vortex::array::IntoArray;
@@ -15,15 +17,15 @@ use vortex::array::arrays::PrimitiveArray;
 use vortex::array::arrays::StructArray;
 use vortex::array::arrays::TemporalArray;
 use vortex::array::arrays::UnionArray;
-use vortex::array::builders::ArrayBuilder;
-use vortex::array::builders::VarBinViewBuilder;
+use vortex::array::arrays::VarBinViewArray;
+use vortex::array::arrays::varbinview::BinaryView;
 use vortex::array::builtins::ArrayBuiltins;
 use vortex::array::dtype::extension::ExtDType;
 use vortex::array::validity::Validity;
 use vortex::buffer::BitBuffer;
 use vortex::buffer::Buffer;
-use vortex::buffer::BufferAllocatorRef;
 use vortex::buffer::BufferMut;
+use vortex::buffer::ByteBuffer;
 use vortex::dtype::DType;
 use vortex::dtype::DecimalDType;
 use vortex::dtype::DecimalType;
@@ -49,8 +51,6 @@ use crate::cpp::duckdb_date;
 use crate::cpp::duckdb_hugeint;
 use crate::cpp::duckdb_list_entry;
 use crate::cpp::duckdb_string_t;
-use crate::cpp::duckdb_string_t_data;
-use crate::cpp::duckdb_string_t_length;
 use crate::cpp::duckdb_time;
 use crate::cpp::duckdb_time_ns;
 use crate::cpp::duckdb_timestamp;
@@ -60,27 +60,6 @@ use crate::cpp::duckdb_timestamp_s;
 use crate::duckdb::DataChunkRef;
 use crate::duckdb::VectorRef;
 use crate::exporter::precision_to_duckdb_storage_size;
-
-pub struct DuckString<'a> {
-    ptr: &'a mut duckdb_string_t,
-}
-
-impl<'a> DuckString<'a> {
-    pub(crate) fn new(ptr: &'a mut duckdb_string_t) -> Self {
-        DuckString { ptr }
-    }
-}
-
-impl<'a> DuckString<'a> {
-    /// convert duckdb_string_t to a byte slice
-    pub fn as_bytes(&mut self) -> &'a [u8] {
-        unsafe {
-            let len = duckdb_string_t_length(*self.ptr);
-            let c_ptr = duckdb_string_t_data(self.ptr);
-            std::slice::from_raw_parts(c_ptr.cast::<u8>(), len as usize)
-        }
-    }
-}
 
 fn vector_as_slice<T: NativePType>(vector: &VectorRef, len: usize) -> ArrayRef {
     let data = vector.as_slice_with_len::<T>(len);
@@ -113,23 +92,63 @@ fn vector_mapped<T, P: NativePType, F: Fn(&T) -> P>(
     .into_array()
 }
 
+/// Builds views straight from DuckDB's `string_t`, which has the same 16-byte shape as a
+/// [`BinaryView`]: values of up to 12 bytes are inlined, longer ones carry a 4-byte prefix and a
+/// pointer. Long values are copied into a single data buffer.
 fn vector_as_string_blob(vector: &VectorRef, len: usize, dtype: DType) -> ArrayRef {
     let data = vector.as_slice_with_len::<duckdb_string_t>(len);
     let validity = vector.validity_ref(len);
+    // SAFETY: `length` sits at the same offset in both union variants.
+    let length = |s: &duckdb_string_t| unsafe { s.value.inlined.length } as usize;
 
-    let mut builder =
-        VarBinViewBuilder::with_capacity_in(dtype, len, BufferAllocatorRef::statically_allocated());
-
+    let heap_len = data
+        .iter()
+        .enumerate()
+        .filter(|&(i, s)| validity.is_valid(i) && length(s) > BinaryView::MAX_INLINED_SIZE)
+        .map(|(_, s)| length(s))
+        .sum();
+    let mut heap = BufferMut::<u8>::with_capacity(heap_len);
+    let mut views = BufferMut::<BinaryView>::with_capacity(len);
     for (i, s) in data.iter().enumerate() {
-        if validity.is_valid(i) {
-            let mut ptr = *s;
-            builder.append_value(DuckString::new(&mut ptr).as_bytes())
+        if !validity.is_valid(i) {
+            views.push(BinaryView::empty_view());
+            continue;
+        }
+        let len = length(s);
+        if len <= BinaryView::MAX_INLINED_SIZE {
+            // SAFETY: short values live in the inlined variant, whose 12 bytes are all readable.
+            let inlined = unsafe { s.value.inlined.inlined };
+            let mut le_bytes = [0u8; 16];
+            le_bytes[..4].copy_from_slice(&(len as u32).to_le_bytes());
+            for (dst, src) in le_bytes[4..].iter_mut().zip(inlined) {
+                *dst = src as u8;
+            }
+            // Zero the bytes past the value, as inlined views require.
+            let keep_bits = 32 + 8 * len;
+            let mask = if keep_bits >= 128 { u128::MAX } else { (1u128 << keep_bits) - 1 };
+            views.push(BinaryView::from(u128::from_le_bytes(le_bytes) & mask));
         } else {
-            builder.append_null()
+            // SAFETY: long values live in the pointer variant, which owns `len` readable bytes.
+            let bytes: &[u8] = unsafe { std::slice::from_raw_parts(s.value.pointer.ptr.cast(), len) };
+            let offset = u32::try_from(heap.len()).vortex_expect("chunk string data fits u32");
+            heap.extend_from_slice(bytes);
+            views.push(BinaryView::new_ref(
+                u32::try_from(len).vortex_expect("string length fits u32"),
+                [bytes[0], bytes[1], bytes[2], bytes[3]],
+                0,
+                offset,
+            ));
         }
     }
-
-    builder.finish()
+    let buffers: Arc<[ByteBuffer]> = if heap.is_empty() {
+        Arc::from([])
+    } else {
+        Arc::from([heap.freeze()])
+    };
+    // SAFETY: every view references an in-bounds range of `buffers`, and DuckDB VARCHAR/BLOB
+    // values already satisfy the target dtype.
+    unsafe { VarBinViewArray::new_unchecked(views.freeze(), buffers, dtype, validity.to_validity()) }
+        .into_array()
 }
 
 /// Converts a valid [`duckdb_list_entry`] to `(offset, size)`, updating tracking state.
@@ -641,6 +660,8 @@ mod tests {
     use vortex::array::arrays::MapArray;
     use vortex::array::arrays::PrimitiveArray;
     use vortex::array::arrays::UnionArray;
+use vortex::array::arrays::VarBinViewArray;
+use vortex::array::arrays::varbinview::BinaryView;
     use vortex::array::arrays::VarBinViewArray;
     use vortex::array::arrays::extension::ExtensionArrayExt;
     use vortex::array::arrays::fixed_size_list::FixedSizeListArrayExt;

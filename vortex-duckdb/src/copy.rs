@@ -101,6 +101,7 @@ fn copy_write_options() -> vortex::file::VortexWriteOptions {
                 vortex_btrblocks::schemes::integer::DeltaScheme::default().id(),
             ]),
         )
+        .with_data_block_target_bytes(Some(16 << 20))
         .build();
     SESSION.write_options().with_strategy(strategy)
 }
@@ -220,6 +221,53 @@ struct StatsAccumulators {
     varlen_bounds: BTreeMap<String, VarlenBounds>,
 }
 
+impl StatsAccumulators {
+    /// Fold another accumulator into this one. All tracked stats (bounds and
+    /// counts) are order-independent, so partial accumulators computed on
+    /// disjoint chunks in parallel merge to the same result.
+    fn merge(&mut self, other: StatsAccumulators) {
+        for (key, theirs) in other.leaf {
+            match self.leaf.entry(key) {
+                Entry::Vacant(entry) => {
+                    entry.insert(theirs);
+                }
+                Entry::Occupied(mut entry) => {
+                    let ours = entry.get_mut();
+                    ours.stats =
+                        std::mem::take(&mut ours.stats).merge_unordered(&theirs.stats, &ours.dtype);
+                    ours.num_values += theirs.num_values;
+                    ours.extra_nulls += theirs.extra_nulls;
+                }
+            }
+        }
+        for (key, theirs) in other.uuid {
+            let ours = self.uuid.entry(key).or_default();
+            if let Some(min) = theirs.min
+                && ours.min.is_none_or(|m| min < m)
+            {
+                ours.min = Some(min);
+            }
+            if let Some(max) = theirs.max
+                && ours.max.is_none_or(|m| max > m)
+            {
+                ours.max = Some(max);
+            }
+        }
+        for (key, theirs) in other.varlen_bounds {
+            match self.varlen_bounds.entry(key) {
+                Entry::Vacant(entry) => {
+                    entry.insert(theirs);
+                }
+                Entry::Occupied(mut entry) => {
+                    let ours = entry.get_mut();
+                    ours.stats =
+                        std::mem::take(&mut ours.stats).merge_unordered(&theirs.stats, &ours.dtype);
+                }
+            }
+        }
+    }
+}
+
 /// Write to a file has two phases, writing data chunks and then closing the file.
 /// We use a spawned tokio task to actually compress arrays and write it to disk.
 /// Each chunk is pushed into the sink and read from the task.
@@ -264,11 +312,14 @@ fn push_to_writer(global: &CopyFunctionGlobal, array: ArrayRef) -> VortexResult<
         .as_ref()
         .ok_or_else(|| vortex_err!("sink closed early"))?
         .clone();
+    // Park until the channel has room rather than `RUNTIME.block_on`, which would run queued
+    // compression tasks on this thread. DuckDB flushes batches from one thread at a time, so
+    // stealing work here stalls the whole pipeline; the worker pool drives the writer instead.
+    // send may error with "receiver is gone" which isn't the real error
+    if futures::executor::block_on(sink.send(Ok(array))).is_ok() {
+        return Ok(());
+    }
     RUNTIME.block_on(async {
-        // send may error with "receiver is gone" which isn't the real error
-        if sink.send(Ok(array)).await.is_ok() {
-            return Ok(());
-        }
         let task = global.write_task.lock().take();
         if let Some(task) = task {
             // we can get the real error (i.e invalid path) from here
@@ -284,7 +335,9 @@ pub fn copy_to_sink(
     chunk: &mut DataChunkRef,
 ) -> VortexResult<()> {
     let array = data_chunk_to_vortex(bind_data.fields.names(), chunk)?;
-    accumulate_chunk_leaf_stats(init_global, &array)?;
+    let mut stats = StatsAccumulators::default();
+    accumulate_chunk_leaf_stats(&mut stats, &array)?;
+    init_global.stats.lock().merge(stats);
     push_to_writer(init_global, array)
 }
 
@@ -300,7 +353,10 @@ pub fn accumulate_stats_chunk(
 ) -> VortexResult<()> {
     let fields = FieldNames::from([FieldName::from(name)]);
     let array = data_chunk_to_vortex(&fields, chunk)?;
-    accumulate_chunk_leaf_stats(global, &array)
+    let mut stats = StatsAccumulators::default();
+    accumulate_chunk_leaf_stats(&mut stats, &array)?;
+    global.stats.lock().merge(stats);
+    Ok(())
 }
 
 /// Statistics tracked per leaf path; `column_size_bytes` is attached at
@@ -309,15 +365,11 @@ const LEAF_STATS: &[Stat] = &[Stat::Min, Stat::Max, Stat::NullCount, Stat::NaNCo
 
 /// Accumulate leaf statistics for every nested field of the pushed chunk, matching
 /// the leaf paths the parquet writer emits (`"s"."child"`, `"l"."element"`).
-fn accumulate_chunk_leaf_stats(
-    global: &CopyFunctionGlobal,
-    chunk: &ArrayRef,
-) -> VortexResult<()> {
+fn accumulate_chunk_leaf_stats(acc: &mut StatsAccumulators, chunk: &ArrayRef) -> VortexResult<()> {
     let mut ctx = SESSION.create_execution_ctx();
     let Canonical::Struct(struct_array) = chunk.clone().execute(&mut ctx)? else {
         vortex_bail!("COPY chunk is not a struct array, got {}", chunk.dtype());
     };
-    let mut acc = global.stats.lock();
     let mut path = Vec::new();
     for (name, child) in struct_array
         .names()
@@ -325,7 +377,7 @@ fn accumulate_chunk_leaf_stats(
         .zip(struct_array.iter_unmasked_fields())
     {
         path.push(Field::Name(name.clone()));
-        accumulate_leaf_stats(&mut acc, &mut path, child, 0, &mut ctx)?;
+        accumulate_leaf_stats(acc, &mut path, child, 0, &mut ctx)?;
         path.pop();
     }
     Ok(())
@@ -569,9 +621,12 @@ fn quoted_leaf_key(path: &[Field]) -> String {
         .join(".")
 }
 
+/// Leaf stats are computed here during the parallel prepare phase; DuckDB
+/// flushes prepared batches one at a time, so flush only merges them.
 #[derive(Default)]
 pub struct CopyPreparedBatch {
     arrays: Vec<ArrayRef>,
+    stats: Mutex<Option<StatsAccumulators>>,
 }
 
 pub fn prepare_batch_push(
@@ -579,15 +634,17 @@ pub fn prepare_batch_push(
     batch: &mut CopyPreparedBatch,
     chunk: &DataChunkRef,
 ) -> VortexResult<()> {
-    batch
-        .arrays
-        .push(data_chunk_to_vortex(bind.fields.names(), chunk)?);
+    let array = data_chunk_to_vortex(bind.fields.names(), chunk)?;
+    accumulate_chunk_leaf_stats(batch.stats.get_mut().get_or_insert_default(), &array)?;
+    batch.arrays.push(array);
     Ok(())
 }
 
 pub fn flush_batch(global: &CopyFunctionGlobal, batch: &CopyPreparedBatch) -> VortexResult<()> {
+    if let Some(stats) = batch.stats.lock().take() {
+        global.stats.lock().merge(stats);
+    }
     for array in &batch.arrays {
-        accumulate_chunk_leaf_stats(global, array)?;
         push_to_writer(global, array.clone())?;
     }
     Ok(())
