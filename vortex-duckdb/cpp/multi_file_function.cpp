@@ -524,7 +524,7 @@ unique_ptr<TableFunctionData> VortexMultiFileInfo::InitializeBindData(MultiFileB
 	if (options_p) {
 		result->encryption_key = options_p->Cast<VortexFileReaderOptions>().encryption_key;
 	}
-	return std::move(result);
+	return result;
 }
 
 void VortexMultiFileInfo::BindReader(ClientContext &context, vector<LogicalType> &return_types, vector<Identifier> &names,

@@ -80,7 +80,7 @@ unique_ptr<FunctionData> VortexFullMetadataBind(ClientContext &context, TableFun
 	names = {Identifier("vortex_file_metadata"), Identifier("vortex_schema"), Identifier("vortex_column_stats")};
 	return_types = {LogicalType::LIST(FileMetadataStructType()), LogicalType::LIST(SchemaStructType()),
 	                LogicalType::LIST(ColumnStatsStructType())};
-	return std::move(result);
+	return result;
 }
 
 unique_ptr<GlobalTableFunctionState> VortexFullMetadataInitGlobal(ClientContext &, TableFunctionInitInput &input) {

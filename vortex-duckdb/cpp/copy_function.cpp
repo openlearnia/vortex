@@ -100,7 +100,7 @@ unique_ptr<FunctionData> copy_to_bind(ClientContext &,
     auto result = make_uniq<VortexCopyBindData>(std::move(cdata), names, types);
     result->field_ids = std::move(field_ids);
     result->encryption_key = std::move(encryption_key);
-    return std::move(result);
+    return result;
 }
 
 unique_ptr<GlobalFunctionData>
