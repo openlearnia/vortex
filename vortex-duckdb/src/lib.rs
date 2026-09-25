@@ -60,7 +60,13 @@ static RUNTIME: LazyLock<CurrentThreadRuntime> = LazyLock::new(CurrentThreadRunt
 /// flush path.
 static WORKER_POOL: LazyLock<CurrentThreadWorkerPool> = LazyLock::new(|| {
     let pool = RUNTIME.new_pool();
-    pool.set_workers_to_available_parallelism();
+    // Half of available parallelism: the pool shares the machine with DuckDB's own executor
+    // threads, and sizing it to every core oversubscribes both pools during COPY (measured:
+    // ~7% more user CPU and noisier sustained inserts than a balanced split).
+    let n = vortex_utils::parallelism::get_available_parallelism()
+        .map(|n| (n / 2).max(1))
+        .unwrap_or(1);
+    pool.set_workers(n);
     pool
 });
 /// Process-wide registry, so repeated scans against the same bucket share one client.
