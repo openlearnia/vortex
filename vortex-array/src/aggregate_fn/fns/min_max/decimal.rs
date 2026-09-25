@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use itertools::Itertools;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
 
@@ -59,24 +58,17 @@ where
 }
 
 fn compute_min_max<'a, T>(
-    iter: impl Iterator<Item = &'a T>,
+    mut iter: impl Iterator<Item = &'a T>,
     decimal_dtype: DecimalDType,
 ) -> Option<MinMaxResult>
 where
     T: Into<DecimalValue> + NativeDecimalType + Ord + Copy + 'a,
 {
-    match iter.minmax_by(|a, b| a.cmp(b)) {
-        itertools::MinMaxResult::NoElements => None,
-        itertools::MinMaxResult::OneElement(&x) => {
-            let scalar = Scalar::decimal(x.into(), decimal_dtype, NonNullable);
-            Some(MinMaxResult {
-                min: scalar.clone(),
-                max: scalar,
-            })
-        }
-        itertools::MinMaxResult::MinMax(&min, &max) => Some(MinMaxResult {
-            min: Scalar::decimal(min.into(), decimal_dtype, NonNullable),
-            max: Scalar::decimal(max.into(), decimal_dtype, NonNullable),
-        }),
-    }
+    // A branch-free fold vectorizes for the primitive-backed decimal widths.
+    let first = *iter.next()?;
+    let (min, max) = iter.fold((first, first), |(min, max), &x| (min.min(x), max.max(x)));
+    Some(MinMaxResult {
+        min: Scalar::decimal(min.into(), decimal_dtype, NonNullable),
+        max: Scalar::decimal(max.into(), decimal_dtype, NonNullable),
+    })
 }
