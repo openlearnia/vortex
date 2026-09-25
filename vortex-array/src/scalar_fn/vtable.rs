@@ -18,15 +18,19 @@ use vortex_session::VortexSession;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
+use crate::arrays::ConstantArray;
 use crate::arrays::ScalarFn;
 use crate::arrays::ScalarFnArray;
 use crate::dtype::DType;
 use crate::expr::BoundExpression;
 use crate::expr::Expression;
 use crate::expr::display::ExprDisplay;
+use crate::expr::lit;
+use crate::scalar::Scalar;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnRef;
 use crate::scalar_fn::TypedScalarFnInstance;
+use crate::scalar_fn::fns::literal::Literal;
 
 /// This trait defines the interface for scalar function vtables, including methods for
 /// serialization, deserialization, validation, child naming, return type computation,
@@ -245,6 +249,14 @@ pub trait ReduceNode: Clone {
     /// Create a new node from the given scalar function and children, inheriting this node's
     /// reduction context (e.g. the expression scope, or the array row count).
     fn new_node(&self, scalar_fn: ScalarFnRef, children: &[Self]) -> VortexResult<Self>;
+
+    /// Return a scalar value if this node is constant
+    fn as_constant(&self) -> Option<Scalar> {
+        None
+    }
+
+    /// Produce a new constant node in the same scope as "self"
+    fn new_constant(&self, value: Scalar) -> Self;
 }
 
 /// A [`ReduceNode`] over an expression tree, typed within a scope.
@@ -310,6 +322,17 @@ impl ReduceNode for ExpressionReduceNode<'_> {
             expression: Cow::Owned(expression),
             scope: self.scope,
         })
+    }
+
+    fn as_constant(&self) -> Option<Scalar> {
+        self.expression.as_opt::<Literal>().cloned()
+    }
+
+    fn new_constant(&self, value: Scalar) -> Self {
+        Self {
+            expression: Cow::Owned(lit(value)),
+            scope: self.scope,
+        }
     }
 }
 
@@ -379,6 +402,17 @@ impl ReduceNode for ArrayReduceNode<'_> {
         Ok(Self {
             array: Cow::Owned(array.into_array()),
         })
+    }
+
+    fn as_constant(&self) -> Option<Scalar> {
+        self.array.as_constant()
+    }
+
+    fn new_constant(&self, value: Scalar) -> Self {
+        let array = ConstantArray::new(value, self.array.len());
+        Self {
+            array: Cow::Owned(array.into_array()),
+        }
     }
 }
 
