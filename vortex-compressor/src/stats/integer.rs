@@ -370,26 +370,36 @@ where
     let buffer = array.to_buffer::<T>();
     let head = buffer[head_idx];
 
+    // Distinct counting stops once the map holds more than len/2 entries: at that point the
+    // dictionary threshold (`distinct > value_count/2`) is already decided, so high-cardinality
+    // columns no longer pay for per-element hashing.
+    let distinct_cap = array.len() / 2;
     let mut loop_state = LoopState {
         distinct_values: if count_distinct_values {
-            HashMap::with_capacity_and_hasher(array.len() / 2, FxBuildHasher)
+            HashMap::with_capacity_and_hasher((array.len() / 2).min(8192), FxBuildHasher)
         } else {
             HashMap::with_hasher(FxBuildHasher)
         },
         prev: head,
         runs: 1,
+        distinct_cap,
     };
 
     let sliced = buffer.slice(head_idx..array.len());
     let (chunks, remainder) = sliced.as_slice().as_chunks::<64>();
+    // The cap is checked once per chunk: crossing it mid-chunk inserts at most 63 extra
+    // entries, which does not change any consumer verdict.
+    let counting = |state: &LoopState<T>| {
+        count_distinct_values && state.distinct_values.len() <= state.distinct_cap
+    };
     match validity.bit_buffer() {
         AllOr::All => {
             for chunk in chunks {
-                inner_loop_nonnull(chunk, count_distinct_values, &mut loop_state)
+                inner_loop_nonnull(chunk, counting(&loop_state), &mut loop_state)
             }
             inner_loop_naive(
                 remainder,
-                count_distinct_values,
+                counting(&loop_state),
                 &BitBuffer::new_set(remainder.len()),
                 &mut loop_state,
             );
@@ -406,11 +416,11 @@ where
                     // All nulls -> no stats to update.
                     0 => continue,
                     // Inner loop for when validity check can be elided.
-                    64 => inner_loop_nonnull(chunk, count_distinct_values, &mut loop_state),
+                    64 => inner_loop_nonnull(chunk, counting(&loop_state), &mut loop_state),
                     // Inner loop for when we need to check validity.
                     _ => inner_loop_nullable(
                         chunk,
-                        count_distinct_values,
+                        counting(&loop_state),
                         &validity,
                         &mut loop_state,
                     ),
@@ -419,7 +429,7 @@ where
             // Final iteration, run naive loop.
             inner_loop_naive(
                 remainder,
-                count_distinct_values,
+                counting(&loop_state),
                 &mask.slice(offset..(offset + remainder.len())),
                 &mut loop_state,
             );
@@ -440,6 +450,25 @@ where
         .vortex_expect("max should be computed");
 
     let distinct = count_distinct_values.then(|| {
+        let capped = loop_state.distinct_values.len() > distinct_cap;
+        let distinct_count = if !capped {
+            u32::try_from(loop_state.distinct_values.len())
+                .vortex_expect("there are more than `u32::MAX` distinct values")
+        } else if array.len() > 1
+            && null_count == 0
+            && max_minus_min(max, min) % (array.len() as u64 - 1) == 0
+        {
+            // Any step-s sequence over `len` elements has `max - min = s * (len - 1)`, so this
+            // divisibility is the necessary condition for sequence encoding. Reporting `len`
+            // keeps it eligible; the deferred probe verifies the actual values, so a false
+            // positive here only costs that probe.
+            u32::try_from(array.len()).vortex_expect("array len should fit u32")
+        } else {
+            // Sentinel satisfying every consumer: above the dictionary threshold, never `1`
+            // (a capped column is not constant), never equal to `len` unless `len <= 3`.
+            u32::try_from(distinct_cap + 1).vortex_expect("cap should fit u32")
+        };
+
         let (&top_value, &top_count) = loop_state
             .distinct_values
             .iter()
@@ -447,8 +476,7 @@ where
             .vortex_expect("we know this is non-empty");
 
         DistinctInfo {
-            distinct_count: u32::try_from(loop_state.distinct_values.len())
-                .vortex_expect("there are more than `u32::MAX` distinct values"),
+            distinct_count,
             most_frequent_value: top_value.0,
             top_frequency: top_count,
             distinct_values: loop_state.distinct_values,
@@ -476,6 +504,15 @@ struct LoopState<T> {
     runs: u32,
     /// The distinct values map.
     distinct_values: HashMap<NativeValue<T>, u32, FxBuildHasher>,
+    /// Stop inserting once the map holds more than this many values.
+    distinct_cap: usize,
+}
+
+/// Widened `max - min` used by the all-unique sentinel check.
+fn max_minus_min<T: IntegerPType>(max: T, min: T) -> u64 {
+    let max = max.to_i64().map(i128::from).unwrap_or(i128::MAX);
+    let min = min.to_i64().map(i128::from).unwrap_or(i128::MIN);
+    u64::try_from(max - min).unwrap_or(u64::MAX)
 }
 
 /// Inner loop for non-null chunks of 64 values.
@@ -561,6 +598,7 @@ mod tests {
     use vortex_buffer::BitBuffer;
     use vortex_buffer::Buffer;
     use vortex_buffer::buffer;
+    use vortex_error::VortexExpect;
     use vortex_error::VortexResult;
 
     use super::IntegerStats;
@@ -627,5 +665,32 @@ mod tests {
         assert_eq!(stats.null_count, 1);
         assert_eq!(stats.average_run_length, 1);
         assert_eq!(stats.distinct_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_distinct_count_capped_high_cardinality() {
+        let mut ctx = array_session().create_execution_ctx();
+        // ~100 distinct values spread over a wide range: counting stops once the dictionary
+        // verdict is decided (>50% distinct), reporting the len/2+1 sentinel.
+        let array = PrimitiveArray::new(
+            (0..100u32)
+                .map(|i| (i * 7919) % 60 + (i / 60) * 1_000_000)
+                .collect::<Buffer<u32>>(),
+            Validity::NonNullable,
+        );
+        let stats = typed_int_stats::<u32>(&array, true, &mut ctx)
+            .vortex_expect("stats should not fail");
+        assert_eq!(stats.distinct_count().unwrap(), 51);
+    }
+
+    #[test]
+    fn test_distinct_count_capped_all_unique_span() {
+        let mut ctx = array_session().create_execution_ctx();
+        // Capped, but `max - min == len - 1` proves the column is all-unique, so `len` is
+        // reported to keep sequence encoding eligible.
+        let array = PrimitiveArray::new((0..100u32).collect::<Buffer<u32>>(), Validity::NonNullable);
+        let stats = typed_int_stats::<u32>(&array, true, &mut ctx)
+            .vortex_expect("stats should not fail");
+        assert_eq!(stats.distinct_count().unwrap(), 100);
     }
 }
