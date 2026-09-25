@@ -66,9 +66,10 @@ idx_t duckdb_vx_aggregate_len(duckdb_vx_agg_input ffi_input) {
 duckdb_vx_expr duckdb_vx_aggregate_at(duckdb_vx_agg_input ffi_input, idx_t i, idx_t *proj_idx) {
     const auto &input = *reinterpret_cast<const TableFunctionUngroupedAggregateInput *>(ffi_input);
     const auto &[scan_index, expr] = input.projections[i];
-    *proj_idx = scan_index == COUNT_STAR_PROJ_IDX
-                    ? scan_index.GetIndexUnsafe()
-                    : input.get.GetColumnIds()[scan_index].GetPrimaryIndex();
+    // COUNT_STAR_PROJ_IDX is a macro (UINT64_MAX) in this TU via vortex.h, so test
+    // validity instead of comparing against the constant.
+    *proj_idx = scan_index.IsValid() ? input.get.GetColumnIds()[scan_index].GetPrimaryIndex()
+                                     : scan_index.GetIndexUnsafe();
     return get_ffi_expr(expr);
 }
 }
