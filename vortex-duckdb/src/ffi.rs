@@ -640,6 +640,26 @@ pub unsafe extern "C-unwind" fn duckdb_vortex_full_metadata_stat_at(
     true
 }
 
+/// Returns the `ducklake.field_ids` metadata segment cached in an open
+/// `FullMetadata` handle. Returns false when the file carries no segment.
+/// The returned pointer borrows from `meta`; do not free.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_vortex_full_metadata_field_ids(
+    meta: *const c_void,
+    out_ptr: *mut *const u8,
+    out_len: *mut usize,
+) -> bool {
+    let meta = unsafe { &*(meta as *const crate::full_metadata::FullMetadata) };
+    let Some(bytes) = meta.field_ids.as_ref() else {
+        return false;
+    };
+    unsafe {
+        *out_ptr = bytes.as_ptr();
+        *out_len = bytes.len();
+    }
+    true
+}
+
 /// Reads the `ducklake.field_ids` metadata segment from a Vortex file.
 /// Returns a malloc'd buffer (caller frees with `free`) or null when absent.
 /// On I/O/parse error, sets `error_out` and returns null.

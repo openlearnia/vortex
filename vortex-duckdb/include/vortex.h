@@ -187,6 +187,11 @@ bool duckdb_vortex_full_metadata_stat_at(const void *meta,
                                          duckdb_vx_column_stat *out);
 
 extern
+bool duckdb_vortex_full_metadata_field_ids(const void *meta,
+                                           const uint8_t **out_ptr,
+                                           size_t *out_len);
+
+extern
 uint8_t *duckdb_vortex_read_ducklake_field_ids(const char *file_path,
                                                size_t *len_out,
                                                duckdb_vx_error *error_out);

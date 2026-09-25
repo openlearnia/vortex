@@ -10,6 +10,11 @@
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
+#include "duckdb/common/optional_idx.hpp"
+#include "duckdb/common/serializer/binary_deserializer.hpp"
+#include "duckdb/common/serializer/memory_stream.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -102,19 +107,93 @@ Value BuildFileMetadataValue(const string &path, void *meta) {
 	return Value::LIST(FileMetadataStructType(), std::move(list_vals));
 }
 
+// The field_ids blob is a BinarySerializer-encoded STRUCT mirroring the table's
+// field tree: leaf fields are BIGINT ids, nested fields are STRUCTs with a
+// "__duckdb_field_id" member plus one member per child.
+static const Value *FindFieldIdEntry(const Value &level, const string &name) {
+	if (level.type().id() != LogicalTypeId::STRUCT) {
+		return nullptr;
+	}
+	auto &children = StructValue::GetChildren(level);
+	for (idx_t i = 0; i < children.size(); i++) {
+		if (StringUtil::CIEquals(StructType::GetChildName(level.type(), i).GetIdentifierName(), name)) {
+			return &children[i];
+		}
+	}
+	return nullptr;
+}
+
+// Walks the schema nodes in DFS order against the field-ids tree, collecting
+// one field_id per node. Appends in pre-order to `out`.
+static void AssignFieldIds(const vector<duckdb_vx_schema_node> &nodes, idx_t &idx, idx_t count, const Value *level,
+                           vector<optional_idx> &out) {
+	for (idx_t k = 0; k < count && idx < nodes.size(); k++) {
+		auto &node = nodes[idx++];
+		auto node_name = StringFromFFI(node.name, node.name_len);
+		const Value *entry = level ? FindFieldIdEntry(*level, node_name) : nullptr;
+		optional_idx id;
+		const Value *child_level = nullptr;
+		if (entry) {
+			if (entry->type().id() == LogicalTypeId::BIGINT) {
+				if (!entry->IsNull()) {
+					id = static_cast<idx_t>(entry->GetValue<int64_t>());
+				}
+			} else if (entry->type().id() == LogicalTypeId::STRUCT) {
+				auto fid = FindFieldIdEntry(*entry, "__duckdb_field_id");
+				if (fid && fid->type().id() == LogicalTypeId::BIGINT && !fid->IsNull()) {
+					id = static_cast<idx_t>(fid->GetValue<int64_t>());
+				}
+				child_level = entry;
+			}
+		} else if (node_name == "key_value") {
+			// MAP fields carry key/value at the same level; the key_value schema
+			// node itself is synthetic and has no field id.
+			child_level = level;
+		}
+		out.push_back(id);
+		AssignFieldIds(nodes, idx, node.num_children, child_level, out);
+	}
+}
+
 Value BuildSchemaValue(void *meta) {
-	vector<Value> rows;
 	const auto count = duckdb_vortex_full_metadata_schema_count(meta);
+	vector<duckdb_vx_schema_node> nodes;
+	nodes.reserve(count);
 	for (size_t i = 0; i < count; i++) {
 		duckdb_vx_schema_node node;
 		if (!duckdb_vortex_full_metadata_schema_at(meta, i, &node)) {
 			break;
 		}
+		nodes.push_back(node);
+	}
+
+	vector<optional_idx> field_ids;
+	const uint8_t *field_ids_ptr = nullptr;
+	size_t field_ids_len = 0;
+	if (!nodes.empty() && duckdb_vortex_full_metadata_field_ids(meta, &field_ids_ptr, &field_ids_len)) {
+		vector<uint8_t> blob(field_ids_ptr, field_ids_ptr + field_ids_len);
+		MemoryStream stream(blob.data(), blob.size());
+		BinaryDeserializer deserializer(stream);
+		deserializer.Begin();
+		auto root_value = Value::Deserialize(deserializer);
+		deserializer.End();
+		// nodes[0] is the synthetic root; its children map to the top-level struct.
+		idx_t idx = 1;
+		AssignFieldIds(nodes, idx, nodes[0].num_children, &root_value, field_ids);
+	}
+
+	vector<Value> rows;
+	for (size_t i = 0; i < nodes.size(); i++) {
+		auto &node = nodes[i];
 		child_list_t<Value> children;
 		children.emplace_back("name", Value(StringFromFFI(node.name, node.name_len)));
 		children.emplace_back("duckdb_type", Value(StringFromFFI(node.duckdb_type, node.duckdb_type_len)));
 		children.emplace_back("num_children", Value::BIGINT(NumericCast<int64_t>(node.num_children)));
-		children.emplace_back("field_id", Value(LogicalType::BIGINT)); // NULL — name mapping does not need field ids
+		Value field_id_value(LogicalType::BIGINT);
+		if (i > 0 && i - 1 < field_ids.size() && field_ids[i - 1].IsValid()) {
+			field_id_value = Value::BIGINT(NumericCast<int64_t>(field_ids[i - 1].GetIndex()));
+		}
+		children.emplace_back("field_id", std::move(field_id_value));
 		rows.push_back(Value::STRUCT(std::move(children)));
 	}
 	return Value::LIST(SchemaStructType(), std::move(rows));

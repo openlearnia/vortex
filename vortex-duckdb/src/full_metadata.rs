@@ -48,6 +48,9 @@ pub struct FullMetadata {
     pub file_size_bytes: u64,
     pub schema: Vec<SchemaNode>,
     pub stats: Vec<ColumnStat>,
+    /// Opaque DuckDB-serialized `ducklake.field_ids` segment, present only in
+    /// DuckLake-written files. C++ side deserializes and assigns per-node ids.
+    pub field_ids: Option<Vec<u8>>,
 }
 
 fn duckdb_type_name(dtype: &DType) -> VortexResult<String> {
@@ -266,12 +269,16 @@ pub fn open_full_metadata(path: &str) -> VortexResult<FullMetadata> {
             .with_file_size(file_size_bytes)
             .open(source)
             .await?;
+        let field_ids = file
+            .metadata_segment(crate::copy::DUCKLAKE_FIELD_IDS_METADATA_KEY)
+            .map(|buf| buf.as_slice().to_vec());
         Ok(FullMetadata {
             file_name: path.to_owned(),
             num_rows: file.row_count(),
             file_size_bytes,
             schema: build_schema(file.dtype())?,
             stats: build_column_stats(&file)?,
+            field_ids,
         })
     })
 }
