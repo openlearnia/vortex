@@ -47,7 +47,7 @@ const SOURCE_FILES: [&str; 12] = [
 
 // Duckdb C API function we use.
 // This lowers codegen'd src/cpp.rs by four times.
-const DUCKDB_C_API_FUNCTIONS: [&str; 135] = [
+const DUCKDB_C_API_FUNCTIONS: [&str; 139] = [
     "duckdb_array_type_array_size",
     "duckdb_array_type_child_type",
     "duckdb_array_vector_get_child",
@@ -94,6 +94,7 @@ const DUCKDB_C_API_FUNCTIONS: [&str; 135] = [
     "duckdb_create_union_type",
     "duckdb_create_varchar_length",
     "duckdb_create_vector",
+    "duckdb_create_enum_type",
     "duckdb_data_chunk_get_column_count",
     "duckdb_data_chunk_get_size",
     "duckdb_data_chunk_get_vector",
@@ -112,6 +113,9 @@ const DUCKDB_C_API_FUNCTIONS: [&str; 135] = [
     "duckdb_destroy_value",
     "duckdb_destroy_vector",
     "duckdb_disconnect",
+    "duckdb_enum_dictionary_size",
+    "duckdb_enum_dictionary_value",
+    "duckdb_enum_internal_type",
     "duckdb_fetch_chunk",
     "duckdb_free",
     "duckdb_geometry_type_get_crs",

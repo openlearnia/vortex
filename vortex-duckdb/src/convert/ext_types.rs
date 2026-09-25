@@ -493,7 +493,7 @@ pub fn logical_type_from_duckdb_ext(
 }
 
 fn enum_internal_ptype(logical_type: &LogicalTypeRef) -> VortexResult<PType> {
-    let ty = unsafe { crate::duckdb_c_api_extra::duckdb_enum_internal_type(logical_type.as_ptr()) };
+    let ty = unsafe { crate::cpp::duckdb_enum_internal_type(logical_type.as_ptr()) };
     Ok(match ty {
         DUCKDB_TYPE::DUCKDB_TYPE_UTINYINT => PType::U8,
         DUCKDB_TYPE::DUCKDB_TYPE_USMALLINT => PType::U16,
@@ -503,13 +503,11 @@ fn enum_internal_ptype(logical_type: &LogicalTypeRef) -> VortexResult<PType> {
 }
 
 fn enum_member_names(logical_type: &LogicalTypeRef) -> VortexResult<Vec<String>> {
-    let size =
-        unsafe { crate::duckdb_c_api_extra::duckdb_enum_dictionary_size(logical_type.as_ptr()) }
-            as usize;
+    let size = unsafe { crate::cpp::duckdb_enum_dictionary_size(logical_type.as_ptr()) } as usize;
     let mut names = Vec::with_capacity(size);
     for i in 0..size {
         let ptr = unsafe {
-            crate::duckdb_c_api_extra::duckdb_enum_dictionary_value(logical_type.as_ptr(), i as _)
+            crate::cpp::duckdb_enum_dictionary_value(logical_type.as_ptr(), i as _)
         };
         if ptr.is_null() {
             vortex_bail!("null enum dictionary value at {i}");
@@ -528,9 +526,9 @@ fn create_enum_logical_type(names: &[String]) -> VortexResult<LogicalType> {
         .iter()
         .map(|n| CString::new(n.as_str()).map_err(|_| vortex_err!("enum name contains NUL")))
         .collect::<Result<_, _>>()?;
-    let ptrs: Vec<*const c_char> = c_names.iter().map(|c| c.as_ptr()).collect();
+    let mut ptrs: Vec<*const c_char> = c_names.iter().map(|c| c.as_ptr()).collect();
     let ty = unsafe {
-        crate::duckdb_c_api_extra::duckdb_create_enum_type(ptrs.as_ptr(), ptrs.len() as _)
+        crate::cpp::duckdb_create_enum_type(ptrs.as_mut_ptr(), ptrs.len() as _)
     };
     if ty.is_null() {
         vortex_bail!("duckdb_create_enum_type failed");

@@ -48,7 +48,6 @@ mod table_function;
 mod cpp;
 mod copy;
 /// cbindgen:ignore
-mod duckdb_c_api_extra;
 #[cfg(test)]
 mod e2e_test;
 
