@@ -21,6 +21,7 @@ use vortex::error::VortexResult;
 use vortex::error::vortex_err;
 use vortex::io::runtime::BlockingRuntime;
 use vortex::io::runtime::current::CurrentThreadRuntime;
+use vortex::io::runtime::current::CurrentThreadWorkerPool;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
 
@@ -53,9 +54,19 @@ mod e2e_test;
 
 // A global runtime for Vortex operations within DuckDB.
 static RUNTIME: LazyLock<CurrentThreadRuntime> = LazyLock::new(CurrentThreadRuntime::new);
+/// Workers that drive the shared executor in the background. Without them,
+/// spawned work (e.g. COPY compression tasks) only makes progress while a
+/// DuckDB thread sits inside `block_on`, which serializes the single-threaded
+/// flush path.
+static WORKER_POOL: LazyLock<CurrentThreadWorkerPool> = LazyLock::new(|| {
+    let pool = RUNTIME.new_pool();
+    pool.set_workers_to_available_parallelism();
+    pool
+});
 /// Process-wide registry, so repeated scans against the same bucket share one client.
 static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
 static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+    LazyLock::force(&WORKER_POOL);
     let session = VortexSession::default().with_handle(RUNTIME.handle());
     session
         .enable_edition(CORE_2026_08_3)
