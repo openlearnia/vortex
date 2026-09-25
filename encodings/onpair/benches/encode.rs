@@ -34,8 +34,10 @@ use divan::Bencher;
 use onpair::Config;
 use onpair::Dictionary;
 use onpair::DictionaryView;
+use onpair::MaxDictBits;
 use onpair::Parser;
 use onpair::Rows;
+use onpair::Threshold;
 use vortex_onpair::DEFAULT_CONFIG;
 use vortex_onpair::fast_lpm;
 use vortex_onpair::fast_lpm::FastLpm;
@@ -375,6 +377,87 @@ fn code_stream_equivalence() {
             codes.len() as f64 / total as f64,
         );
         divan::black_box(codes.len());
+    }
+}
+
+/// The only lever that reduces matcher work: fewer, longer tokens means fewer
+/// codes to emit. `Config::threshold` is the dynamic-threshold sample fraction
+/// and `max_dict_bits` the dictionary budget, so raising either admits more
+/// tokens. This sweeps both and reports the trade-off directly:
+///
+///   * `codes/byte` — the actual driver of encode CPU, since encode cost is
+///     (number of codes) x (cost per probe). `l_comment` already averages
+///     ~11.4 bytes per token against a 16-byte `MAX_TOKEN_SIZE`, so there is
+///     limited headroom to win here.
+///   * `dict_bytes` — what the larger dictionary costs on disk.
+///   * `parse_ms` — measured, not estimated.
+///
+/// A flat `codes/byte` column means the budget is not the binding constraint
+/// and no config change will move the encode cost.
+#[divan::bench]
+fn config_sweep() {
+    const ROWS: usize = 100_000;
+    println!(
+        "{:<9} {:>6} {:>6} {:>7} {:>9} {:>10} {:>10}",
+        "shape", "thresh", "bits", "tokens", "codes/byte", "dict_bytes", "parse_ms"
+    );
+
+    for shape in [Shape::LComment, Shape::UrlLog] {
+        let strings = corpus(ROWS, shape);
+        let total: usize = strings.iter().map(|s| s.len()).sum();
+
+        for (thresh, bits) in [
+            (0.15f64, 12u8),
+            (0.30, 12),
+            (0.50, 12),
+            (0.15, 13),
+            (0.30, 13),
+            (0.50, 13),
+            (0.50, 14),
+        ] {
+            let Ok(max_dict_bits) = MaxDictBits::new(bits) else {
+                continue;
+            };
+            let Ok(threshold) = Threshold::new(thresh) else {
+                continue;
+            };
+            let config = Config {
+                max_dict_bits,
+                threshold,
+                seed: Some(42),
+            };
+
+            let trained = train(strings.clone(), config);
+            let n_tokens = trained.parser.dict.as_view().num_tokens();
+            let dict_bytes: usize = (0..n_tokens)
+                .map(|i| {
+                    trained
+                        .parser
+                        .dict
+                        .as_view()
+                        .token(i as onpair::Token)
+                        .len()
+                })
+                .sum();
+
+            // Time the parse only; training is already done.
+            let iters = 5;
+            let start = std::time::Instant::now();
+            let mut codes = 0usize;
+            for _ in 0..iters {
+                let (c, _) = fast_lpm::parse_rows::<_, u64>(&trained.fast, &trained.rows_view());
+                codes = c.len();
+            }
+            let parse_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+            println!(
+                "{:<9} {thresh:>6.2} {bits:>6} {n_tokens:>7} {:>9.4} {dict_bytes:>10} {parse_ms:>10.2}",
+                shape.name(),
+                codes as f64 / total as f64,
+            );
+            divan::black_box(codes);
+        }
+        println!();
     }
 }
 
