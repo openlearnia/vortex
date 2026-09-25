@@ -13,6 +13,8 @@ use vortex_array::arrays::Constant;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::primitive::PrimitiveArrayExt;
+use vortex_array::match_each_integer_ptype;
+use vortex_array::scalar::PValue;
 use vortex_array::scalar::Scalar;
 use vortex_compressor::builtins::IntDictScheme;
 use vortex_compressor::scheme::ChildSelection;
@@ -23,6 +25,7 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_sparse::Sparse;
 use vortex_sparse::SparseExt as _;
+use vortex_utils::aliases::hash_map::HashMap;
 
 use super::IntRLEScheme;
 use super::RunEndScheme;
@@ -50,10 +53,10 @@ impl Scheme for SparseScheme {
         vec![Sparse.id(), Constant.id()]
     }
 
+    /// No distinct-value hash map: the 90% dominance test only needs the majority value, which
+    /// [`dominant_value`] finds in two linear passes.
     fn stats_options(&self) -> GenerateStatsOptions {
-        GenerateStatsOptions {
-            count_distinct_values: true,
-        }
+        GenerateStatsOptions::default()
     }
 
     /// Children: values=0, indices=1.
@@ -104,12 +107,17 @@ impl Scheme for SparseScheme {
             return CompressionEstimate::Verdict(EstimateVerdict::Ratio(len / value_count as f64));
         }
 
-        let (_, most_frequent_count) = stats
-            .erased()
-            .most_frequent_value_and_count()
-            .vortex_expect(
-                "this must be present since `SparseScheme` declared that we need distinct values",
-            );
+        // A value holding >= 90% of `n` valid values leaves at most `0.1n` others, so at most
+        // `0.2n + 1` runs. Fewer than two values per run rules that out for `n >= 4` without
+        // looking at the data again.
+        if value_count >= 4 && stats.average_run_length() < 2 {
+            return CompressionEstimate::Verdict(EstimateVerdict::Skip);
+        }
+
+        // Any value with >= 90% frequency is a strict majority.
+        let Some((_, most_frequent_count)) = majority_value(data, exec_ctx) else {
+            return CompressionEstimate::Verdict(EstimateVerdict::Skip);
+        };
 
         // If the most frequent value is the only value, we should compress as constant instead.
         if most_frequent_count == value_count {
@@ -137,15 +145,9 @@ impl Scheme for SparseScheme {
         exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
         let len = data.array_len();
-        let stats = data.integer_stats(exec_ctx);
         let array = data.array();
 
-        let (most_frequent_value, most_frequent_count) = stats
-            .erased()
-            .most_frequent_value_and_count()
-            .vortex_expect(
-                "this must be present since `SparseScheme` declared that we need distinct values",
-            );
+        let (most_frequent_value, most_frequent_count) = most_frequent_value(data, exec_ctx);
 
         if most_frequent_count as usize == len {
             // If the most frequent value is the only value, we should compress as constant instead.
@@ -209,5 +211,131 @@ impl Scheme for SparseScheme {
         } else {
             Ok(sparse_encoded)
         }
+    }
+}
+
+/// Strict-majority valid value and its exact count, if any, cached on the [`ArrayAndStats`]
+/// bundle so the estimate and compress passes share one computation.
+#[derive(Clone, Copy)]
+struct Majority(Option<(PValue, u32)>);
+
+/// Returns the valid value held by more than half of the valid values, with its exact count.
+fn majority_value(data: &ArrayAndStats, exec_ctx: &mut ExecutionCtx) -> Option<(PValue, u32)> {
+    let primitive = data.array_as_primitive().into_owned();
+    data.get_or_insert_with::<Majority>(|| {
+        Majority(
+            compute_mode(&primitive, false, exec_ctx)
+                .vortex_expect("majority of a canonical primitive array"),
+        )
+    })
+    .0
+}
+
+/// Returns the most frequent valid value and its exact count. Only the null-dominated path can
+/// reach this without a strict majority, and then the exact count covers few values.
+fn most_frequent_value(data: &ArrayAndStats, exec_ctx: &mut ExecutionCtx) -> (PValue, u32) {
+    majority_value(data, exec_ctx)
+        .or_else(|| {
+            let primitive = data.array_as_primitive().into_owned();
+            compute_mode(&primitive, true, exec_ctx).vortex_expect("mode of a canonical primitive array")
+        })
+        .unwrap_or((PValue::U8(0), 0))
+}
+
+fn compute_mode(
+    array: &PrimitiveArray,
+    exact: bool,
+    exec_ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<(PValue, u32)>> {
+    let validity = array
+        .as_ref()
+        .validity()?
+        .execute_mask(array.as_ref().len(), exec_ctx)?;
+    let bits = (!validity.all_true()).then(|| validity.to_bit_buffer());
+    match_each_integer_ptype!(array.ptype(), |T| {
+        let values = array.as_slice::<T>();
+        let mode = match &bits {
+            None => mode_in(values.iter().copied(), exact),
+            Some(bits) => mode_in(
+                values
+                    .iter()
+                    .zip(bits.iter())
+                    .filter_map(|(value, valid)| valid.then_some(*value)),
+                exact,
+            ),
+        };
+        Ok(mode.map(|(value, count)| (PValue::from(value), count)))
+    })
+}
+
+/// A Boyer–Moore majority vote yields the only possible strict-majority candidate and a second
+/// pass counts it exactly. Without a strict majority this returns `None`, or with `exact` falls
+/// back to a full frequency count.
+fn mode_in<T, I>(values: I, exact: bool) -> Option<(T, u32)>
+where
+    T: Copy + Eq + std::hash::Hash,
+    I: Iterator<Item = T> + Clone,
+{
+    let mut candidate = None;
+    let mut votes = 0u32;
+    let mut total = 0u64;
+    for value in values.clone() {
+        total += 1;
+        if votes == 0 {
+            candidate = Some(value);
+            votes = 1;
+        } else if candidate == Some(value) {
+            votes += 1;
+        } else {
+            votes -= 1;
+        }
+    }
+    let candidate = candidate?;
+    let count = values.clone().filter(|&value| value == candidate).count() as u64;
+    if count * 2 > total {
+        return Some((candidate, u32::try_from(count).ok()?));
+    }
+    if !exact {
+        return None;
+    }
+    let mut frequencies: HashMap<T, u32> = HashMap::default();
+    for value in values {
+        *frequencies.entry(value).or_insert(0) += 1;
+    }
+    frequencies.into_iter().max_by_key(|&(_, count)| count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mode_in;
+
+    #[test]
+    fn strict_majority_is_found_exactly() {
+        let values = [7u32, 1, 7, 2, 7, 7, 3, 7, 7, 7];
+        assert_eq!(mode_in(values.iter().copied(), false), Some((7, 7)));
+    }
+
+    #[test]
+    fn majority_at_the_end_survives_early_votes() {
+        let values = [1i64, 2, 3, 9, 9, 9, 9];
+        assert_eq!(mode_in(values.iter().copied(), false), Some((9, 4)));
+    }
+
+    #[test]
+    fn no_majority_is_none_unless_exact() {
+        let values = [4u8, 4, 4, 1, 2, 3, 5, 6];
+        assert_eq!(mode_in(values.iter().copied(), false), None);
+        assert_eq!(mode_in(values.iter().copied(), true), Some((4, 3)));
+    }
+
+    #[test]
+    fn half_is_not_a_strict_majority() {
+        let values = [5u16, 5, 1, 2];
+        assert_eq!(mode_in(values.iter().copied(), false), None);
+    }
+
+    #[test]
+    fn empty_input_has_no_mode() {
+        assert_eq!(mode_in(std::iter::empty::<u16>(), true), None);
     }
 }
