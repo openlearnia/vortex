@@ -31,6 +31,9 @@ use crate::scan::splits::Splits;
 use crate::scan::tasks::TaskContext;
 use crate::scan::tasks::split_exec;
 
+/// One split of a [`RepeatedScan`], paired with the file row range it covers.
+pub type ScanTask<A> = (Range<u64>, BoxFuture<'static, VortexResult<Option<A>>>);
+
 /// A projected subset (by indices, range, and filter) of rows from a Vortex data source.
 ///
 /// The method of this struct enable, possibly concurrent, scanning of multiple row ranges of this
@@ -120,10 +123,7 @@ impl<A: 'static + Send> RepeatedScan<A> {
     }
 
     /// Returns one task per split, paired with the file row range it covers.
-    pub fn execute(
-        &self,
-        row_range: Option<Range<u64>>,
-    ) -> VortexResult<Vec<(Range<u64>, BoxFuture<'static, VortexResult<Option<A>>>)>> {
+    pub fn execute(&self, row_range: Option<Range<u64>>) -> VortexResult<Vec<ScanTask<A>>> {
         let selection_range: Option<Range<u64>> = match &self.selection {
             Selection::IncludeByIndex(buf) if !buf.is_empty() => {
                 Some(buf[0]..buf[buf.len() - 1] + 1)

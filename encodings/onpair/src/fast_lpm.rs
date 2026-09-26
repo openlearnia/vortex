@@ -20,6 +20,14 @@
 // `try_into` conversions below are infallible by construction. Mirrors the
 // same helpers in the upstream `onpair` crate's `lpm` module.
 #![allow(clippy::unwrap_used)]
+// Every narrowing cast below is bounded by construction, the same way the
+// upstream `onpair` crate's `lpm` module bounds them:
+//   * `i as Token` — a trained dictionary holds at most 2^16 tokens, which
+//     `Token` is sized for (upstream's trainer rejects larger budgets).
+//   * `len as u8` / `slen as u8` — a token is at most `MAX_TOKEN_SIZE` (16)
+//     bytes, so a token length and a suffix length are both <= 8 after the
+//     8-byte prefix split.
+#![allow(clippy::cast_possible_truncation)]
 
 use hashbrown::HashMap;
 use onpair::CompactDictionaryView;

@@ -29,6 +29,9 @@
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_lossless,
+    clippy::panic,
+    clippy::tests_outside_test_module,
+    clippy::redundant_clone,
     clippy::unwrap_used,
     clippy::expect_used
 )]
@@ -36,7 +39,6 @@
 use divan::Bencher;
 use vortex_array::ArrayRef;
 use vortex_array::Canonical;
-use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::PrimitiveArray;
@@ -94,7 +96,7 @@ fn lineitem_key(n: usize) -> PrimitiveArray {
     )
 }
 
-fn blocks(array: &ArrayRef, ctx: &mut ExecutionCtx) -> Vec<ArrayRef> {
+fn blocks(array: &ArrayRef) -> Vec<ArrayRef> {
     let mut out = Vec::new();
     let mut offset = 0;
     while offset < array.len() {
@@ -117,9 +119,8 @@ fn session() -> VortexSession {
 #[divan::bench]
 fn two_pass_l_comment(bencher: Bencher) {
     let s = session();
-    let mut ctx = s.create_execution_ctx();
     let array: ArrayRef = l_comment(200_000).into_array();
-    let src = blocks(&array, &mut ctx);
+    let src = blocks(&array);
     bencher.bench_local(|| {
         let mut ctx = s.create_execution_ctx();
         let mut canonical_blocks = Vec::with_capacity(src.len());
@@ -146,9 +147,8 @@ fn two_pass_l_comment(bencher: Bencher) {
 #[divan::bench]
 fn two_pass_i64(bencher: Bencher) {
     let s = session();
-    let mut ctx = s.create_execution_ctx();
     let array: ArrayRef = lineitem_key(200_000).into_array();
-    let src = blocks(&array, &mut ctx);
+    let src = blocks(&array);
     bencher.bench_local(|| {
         let mut ctx = s.create_execution_ctx();
         let mut canonical_blocks = Vec::with_capacity(src.len());
@@ -177,9 +177,8 @@ fn two_pass_i64(bencher: Bencher) {
 #[divan::bench]
 fn one_pass_l_comment(bencher: Bencher) {
     let s = session();
-    let mut ctx = s.create_execution_ctx();
     let array: ArrayRef = l_comment(200_000).into_array();
-    let src = blocks(&array, &mut ctx);
+    let src = blocks(&array);
     bencher.bench_local(|| {
         let mut ctx = s.create_execution_ctx();
         let chunked = ChunkedArray::try_new(src.clone(), array.dtype().clone())
@@ -199,9 +198,8 @@ fn one_pass_l_comment(bencher: Bencher) {
 #[divan::bench]
 fn one_pass_i64(bencher: Bencher) {
     let s = session();
-    let mut ctx = s.create_execution_ctx();
     let array: ArrayRef = lineitem_key(200_000).into_array();
-    let src = blocks(&array, &mut ctx);
+    let src = blocks(&array);
     bencher.bench_local(|| {
         let mut ctx = s.create_execution_ctx();
         let chunked = ChunkedArray::try_new(src.clone(), array.dtype().clone())
@@ -221,9 +219,8 @@ fn one_pass_i64(bencher: Bencher) {
 #[divan::bench]
 fn canonical_nbytes_accounting(bencher: Bencher) {
     let s = session();
-    let mut ctx = s.create_execution_ctx();
     let array: ArrayRef = l_comment(200_000).into_array();
-    let src = blocks(&array, &mut ctx);
+    let src = blocks(&array);
     let raw_bytes: u64 = src.iter().map(|b| b.nbytes()).sum();
     bencher.bench_local(|| {
         let mut ctx = s.create_execution_ctx();
