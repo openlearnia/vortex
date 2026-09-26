@@ -59,8 +59,14 @@ fn varbin_compute_min_max(
 /// (a zero pad sorts a shorter value first), so full comparisons are only needed on key ties.
 #[inline]
 fn prefix_key(view: &BinaryView) -> u32 {
-    // Bytes 4..8 hold the inlined data or the reference prefix.
-    ((view.as_u128() >> 32) as u32).swap_bytes()
+    // Bytes 4..8 hold the inlined data or the reference prefix. The shift leaves
+    // bits 0..96 and the truncation keeps 0..32, so no data is discarded.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the `>> 32` provably clears the bits the `u32` cast would drop"
+    )]
+    let prefix = (view.as_u128() >> 32) as u32;
+    prefix.swap_bytes()
 }
 
 fn view_extrema<'a>(
